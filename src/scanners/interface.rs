@@ -62,6 +62,7 @@ pub enum WatchError {
 pub const ADDED_ANNOTATION: &str = "crust-gather.io/added";
 pub const UPDATED_ANNOTATION: &str = "crust-gather.io/updated";
 pub const DELETED_ANNOTATION: &str = "crust-gather.io/deleted";
+const DEFAULT_LIST_PAGE_LIMIT: u32 = 100;
 
 #[async_trait]
 /// Collect defines a trait for collecting Kubernetes object representations.
@@ -133,6 +134,14 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// Returns the Kubernetes API client for the resource type this scanner handles.
     fn get_api(&self) -> Api<R>;
 
+    /// Returns the list parameters for this scanner.
+    ///
+    /// Scanners can override this to tune list behavior, such as forcing smaller
+    /// server-side pages when a resource kind produces very large responses.
+    fn list_params(&self) -> ListParams {
+        ListParams::default()
+    }
+
     /// Returns the TypeMetaGetter for the API resource type this scanner handles.
     /// Used to set the TypeMeta on the returned objects in the list,
     /// as the API server does not provide this data in the response.
@@ -143,17 +152,31 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// before getting added to the result.
     #[instrument(skip_all, fields(kind = self.resource().to_type_meta().kind, apiVersion = self.resource().to_type_meta().api_version), err)]
     async fn list(&self) -> anyhow::Result<Vec<R>> {
-        let data = self
-            .get_api()
-            .list(&ListParams::default())
-            .await
-            .map_err(CollectError::List)?;
+        let mut params = self.list_params();
+        params.limit.get_or_insert(DEFAULT_LIST_PAGE_LIMIT);
 
-        Ok(data
-            .items
-            .into_iter()
-            .filter_map(|o| self.filter(&o).ok()?.then_some(o))
-            .collect())
+        let mut objects = vec![];
+
+        loop {
+            let data = self
+                .get_api()
+                .list(&params)
+                .await
+                .map_err(CollectError::List)?;
+
+            objects.extend(
+                data.items
+                    .into_iter()
+                    .filter_map(|o| self.filter(&o).ok()?.then_some(o)),
+            );
+
+            match data.metadata.continue_.filter(|token| !token.is_empty()) {
+                Some(token) => params.continue_token = Some(token),
+                None => break,
+            }
+        }
+
+        Ok(objects)
     }
 
     /// Lists all object and collects representations for them.
