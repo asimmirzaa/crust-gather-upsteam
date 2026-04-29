@@ -83,7 +83,7 @@ impl Logs {
 fn normalize_logs_result(result: Result<String, kube::Error>) -> Result<Option<String>, LogsError> {
     match result {
         Ok(logs) => Ok(Some(logs)),
-        Err(kube::Error::Api(status)) if status.code == 400 => Ok(None),
+        Err(kube::Error::Api(status)) if matches!(status.code, 400 | 404) => Ok(None),
         Err(err) => Err(LogsError(err)),
     }
 }
@@ -258,6 +258,21 @@ mod test {
         };
 
         assert_eq!(status.code, 500);
+    }
+
+    #[test]
+    fn normalize_logs_result_treats_404_as_missing_logs() {
+        let status = Status {
+            code: 404,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+                .expect("deleted pods to be ignored"),
+            None
+        );
     }
 
     #[tokio::test]
