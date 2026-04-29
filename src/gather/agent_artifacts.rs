@@ -4,7 +4,7 @@ use std::fs;
 use anyhow::Context;
 use k8s_openapi::api::core::v1::Pod;
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
@@ -16,7 +16,7 @@ const INDEX_SCHEMA_VERSION: i64 = 1;
 const CLUSTER_SCOPE: &str = "_cluster";
 const LINE_PREVIEW_LIMIT: usize = 240;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OwnerRefEntry {
     pub api_version: String,
     pub kind: String,
@@ -24,7 +24,7 @@ pub struct OwnerRefEntry {
     pub uid: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResourceReference {
     pub relation: String,
     pub target_kind: String,
@@ -32,7 +32,7 @@ pub struct ResourceReference {
     pub target_name: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResourceIndexEntry {
     pub id: String,
     pub api_version: String,
@@ -53,7 +53,7 @@ pub struct ResourceIndexEntry {
     pub references: Vec<ResourceReference>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelationIndexEntry {
     pub source_id: String,
     pub source_path: String,
@@ -65,7 +65,7 @@ pub struct RelationIndexEntry {
     pub target_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogIndexEntry {
     pub path: String,
     pub resource_path: String,
@@ -119,15 +119,14 @@ pub struct AgentArtifactsState {
 
 impl AgentArtifactsState {
     pub fn observe(&mut self, repr: &Representation) -> anyhow::Result<()> {
+        let archive_path = String::try_from(repr.path().clone())?;
         match repr.path() {
-            ArchivePath::Cluster(path) | ArchivePath::Namespaced(path) => {
-                let path = path_to_string(path.as_path())?;
-                let resource = parse_resource_entry(path, repr.data())?;
+            ArchivePath::Cluster(_) | ArchivePath::Namespaced(_) => {
+                let resource = parse_resource_entry(archive_path, repr.data())?;
                 self.resources.insert(resource.path.clone(), resource);
             }
-            ArchivePath::Logs(path) => {
-                let path = path_to_string(path.as_path())?;
-                let log = parse_log_entry(path, repr.data())?;
+            ArchivePath::Logs(_) => {
+                let log = parse_log_entry(archive_path, repr.data())?;
                 self.logs.insert(log.path.clone(), log);
             }
             ArchivePath::Empty
@@ -905,12 +904,6 @@ fn limit_preview(line: &str) -> String {
     preview
 }
 
-fn path_to_string(path: &std::path::Path) -> anyhow::Result<String> {
-    path.to_str()
-        .map(ToString::to_string)
-        .ok_or_else(|| anyhow::anyhow!("archive path is not valid UTF-8"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1027,6 +1020,47 @@ metadata:
         assert!(artifacts.log_index.contains("\"warn_count\":1"));
         assert!(artifacts.log_index.contains("\"error_count\":1"));
         assert!(artifacts.sqlite_bytes.starts_with(b"SQLite format 3"));
+    }
+
+    #[test]
+    fn observed_paths_match_sanitized_archive_paths() {
+        let mut state = AgentArtifactsState::default();
+        state
+            .observe(
+                &Representation::new()
+                    .with_path(ArchivePath::Cluster(
+                        "cluster/rbac.authorization.k8s.io-v1/clusterrolebinding/cert-manager-controller-approve:cert-manager-io.yaml".into(),
+                    ))
+                    .with_data(
+                        r#"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-manager-controller-approve:cert-manager-io
+"#,
+                    ),
+            )
+            .expect("observe");
+
+        let report = RunReport {
+            identity: RunIdentity::default(),
+            inputs: RunInputs::default(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            duration_ms: Some(1),
+            success: true,
+            totals: Default::default(),
+            stats: BTreeMap::new(),
+            warnings: vec![],
+            failures: vec![],
+        };
+
+        let artifacts = state
+            .finalize(&report, &BTreeMap::new(), &[], &[])
+            .expect("finalize");
+
+        assert!(artifacts.resource_index.contains("cert-manager-controller-approve-cert-manager-io.yaml"));
+        assert!(!artifacts.resource_index.contains("cert-manager-controller-approve:cert-manager-io.yaml"));
     }
 
     #[test]

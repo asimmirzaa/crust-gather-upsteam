@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::{Container, EphemeralContainer, Pod};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PodContainerKind {
     App,
@@ -19,7 +19,7 @@ impl std::fmt::Display for PodContainerKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PodContainerRef {
     pub name: String,
     pub image: Option<String>,

@@ -20,6 +20,10 @@ use rmcp::schemars;
 use tracing::level_filters::LevelFilter;
 
 use crate::{
+    analysis::{
+        ai_pack::AiPackCommand, audit::AuditCommand, diff::DiffCommand, graph::GraphCommand,
+        summary::SummaryCommand,
+    },
     filters::{
         filter::{Exclude, FilterGroup, FilterList, FilterType, Include},
         group::Group,
@@ -119,6 +123,36 @@ pub enum Commands {
         serve: Server,
     },
 
+    /// Summarize an offline snapshot for incident triage.
+    Summarize {
+        #[command(flatten)]
+        command: SummaryCommand,
+    },
+
+    /// Compare two offline snapshots and report drift.
+    Diff {
+        #[command(flatten)]
+        command: DiffCommand,
+    },
+
+    /// Audit an offline snapshot for security and upgrade risks.
+    Audit {
+        #[command(flatten)]
+        command: AuditCommand,
+    },
+
+    /// Generate an AI-friendly triage pack from an offline snapshot.
+    AiPack {
+        #[command(flatten)]
+        command: AiPackCommand,
+    },
+
+    /// Export topology relationships from an offline snapshot.
+    Graph {
+        #[command(flatten)]
+        command: GraphCommand,
+    },
+
     /// Start the MCP server over stdio.
     Mcp,
 }
@@ -146,6 +180,11 @@ impl Commands {
             Commands::Serve { serve } => {
                 serve.get_api().await?.serve().await.map_err(|e| anyhow!(e))
             }
+            Commands::Summarize { command } => crate::analysis::summary::run(command),
+            Commands::Diff { command } => crate::analysis::diff::run(command),
+            Commands::Audit { command } => crate::analysis::audit::run(command),
+            Commands::AiPack { command } => crate::analysis::ai_pack::run(command),
+            Commands::Graph { command } => crate::analysis::graph::run(command),
             Commands::Mcp => mcp_server::run().await,
             Commands::Record { config } => {
                 let config = GatherCommands {
