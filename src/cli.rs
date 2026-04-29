@@ -1,10 +1,11 @@
 use std::{
     fs::{self, File},
+    path::Path,
     sync::Arc,
 };
 
 use anyhow::anyhow;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use k8s_openapi::serde::{Deserialize, Serialize};
 use kube::{
     Client,
@@ -33,6 +34,7 @@ use crate::{
             KubeconfigSecretNamespaceName, RunDuration, Secrets, SecretsFile,
         },
         log::HostLog,
+        report::{InputLog, RunInputs, RunReportState},
         server::Server,
         writer::{Archive, Encoding, Writer},
     },
@@ -292,12 +294,19 @@ impl GatherSettings {
             },
             secrets_file: other.secrets_file.or(self.secrets_file.clone()),
             duration: other.duration.or(self.duration),
+            clean_output: other.clean_output.or(self.clean_output),
+            list_page_limit: other.list_page_limit.or(self.list_page_limit),
+            collect_concurrency: other.collect_concurrency.or(self.collect_concurrency),
+            log_collect_concurrency: other
+                .log_collect_concurrency
+                .or(self.log_collect_concurrency),
             systemd_units: if other.systemd_units.is_empty() {
                 self.systemd_units.clone()
             } else {
                 other.systemd_units
             },
             debug_pod: self.debug_pod.merge(other.debug_pod),
+            node_log_mode: other.node_log_mode.or(self.node_log_mode),
         }
     }
 }
@@ -391,6 +400,26 @@ pub struct GatherSettings {
     #[serde(default)]
     pub duration: Option<RunDuration>,
 
+    /// Remove the existing output directory before collecting into it.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    #[serde(default)]
+    pub clean_output: Option<bool>,
+
+    /// Maximum number of objects fetched in a single Kubernetes list page.
+    #[arg(long, value_name = "COUNT")]
+    #[serde(default)]
+    pub list_page_limit: Option<u32>,
+
+    /// Maximum number of object collection tasks to run at once.
+    #[arg(long, value_name = "COUNT")]
+    #[serde(default)]
+    pub collect_concurrency: Option<usize>,
+
+    /// Maximum number of pod log collection tasks to run at once.
+    #[arg(long, value_name = "COUNT")]
+    #[serde(default)]
+    pub log_collect_concurrency: Option<usize>,
+
     /// Name of the kubelet systemd unit.
     ///
     /// Defaults to kubelet.
@@ -406,6 +435,11 @@ pub struct GatherSettings {
     #[command(flatten)]
     #[serde(default)]
     pub debug_pod: DebugPod,
+
+    /// Controls whether node-level debug pods are used for host log collection.
+    #[arg(long, value_enum)]
+    #[serde(default)]
+    pub node_log_mode: Option<NodeLogMode>,
 }
 
 /// OCI Registry storage options.
@@ -653,8 +687,13 @@ impl GatherSettings {
             None
         };
 
+        let archive = self.file.clone().unwrap_or_default();
+        if self.clean_output_enabled() {
+            clean_archive_output(&archive, encoding)?;
+        }
+
         Writer::new(
-            &self.file.clone().unwrap_or_default(),
+            &archive,
             encoding,
             client_config,
             auth,
@@ -666,6 +705,57 @@ impl GatherSettings {
 
 const fn default_oci_buffer_size() -> usize {
     DEFAULT_OCI_BUFFER_SIZE
+}
+
+fn clean_archive_output(archive: &Archive, encoding: &Encoding) -> anyhow::Result<()> {
+    let path = match encoding {
+        Encoding::Path | Encoding::Oci(_) => archive.path(),
+        Encoding::Gzip => archive.path().with_extension("tar.gz"),
+        Encoding::Zip => archive.path().with_extension("zip"),
+    };
+
+    let path_str = path.display().to_string();
+    anyhow::ensure!(
+        !path_str.is_empty(),
+        "refusing to clean an empty output path"
+    );
+
+    let normalized_path = normalized_cleanup_target(&path)?;
+    let current_dir = fs::canonicalize(std::env::current_dir()?)?;
+    anyhow::ensure!(
+        normalized_path != std::path::PathBuf::from("/") && normalized_path != current_dir,
+        "refusing to clean unsafe output path {path_str}"
+    );
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+fn normalized_cleanup_target(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    if path.exists() {
+        return Ok(fs::canonicalize(path)?);
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow!("refusing to clean output path without a terminal path component")
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+
+    Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
 #[derive(Parser, Clone, Default, Deserialize)]
@@ -691,6 +781,34 @@ impl DebugPod {
         Self {
             image: other.image.or(self.image.clone()),
             namespace: other.namespace.or(self.namespace.clone()),
+        }
+    }
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Deserialize,
+    Serialize,
+    Debug,
+    Eq,
+    PartialEq,
+    ValueEnum,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeLogMode {
+    Disabled,
+    #[default]
+    Deep,
+}
+
+impl std::fmt::Display for NodeLogMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "disabled"),
+            Self::Deep => write!(f, "deep"),
         }
     }
 }
@@ -749,7 +867,7 @@ pub struct AdditionalLogs {
     /// --additional-logs specified multiple times allows to collect multiple logs files.
     ///
     /// Example:
-    ///     --additional-logs="my-binary.log:sh -c cat /host/var/log/my-binary.log"
+    ///     --additional-logs="my-binary.log:cat /host/var/log/my-binary.log"
     #[arg(long, alias("additional-logs"), value_name = "FILE:COMMAND",
             value_parser = |arg: &str| -> anyhow::Result<HostLog> {Ok(HostLog::try_from(arg)?)},
             action = ArgAction::Append )]
@@ -999,6 +1117,13 @@ impl GatherCommands {
     }
 
     pub async fn load(&self) -> anyhow::Result<Config> {
+        if self.settings.node_log_mode_value() == NodeLogMode::Disabled
+            && (!self.additional_logs.logs.is_empty()
+                || !self.additional_logs.additional_logs.is_empty())
+        {
+            anyhow::bail!("additional node log commands require --node-log-mode=deep");
+        }
+
         let env_secrets: Secrets = self.settings.secrets.clone().into();
         let mut secrets: Secrets = match self.settings.secrets_file.clone() {
             Some(file) => file.clone().try_into()?,
@@ -1008,6 +1133,52 @@ impl GatherCommands {
         secrets.0.extend(env_secrets.0.into_iter());
 
         let writer: Writer = self.settings.to_writer().await?;
+        let filters = match &self.filter {
+            Some(filter) => vec![filter.clone()],
+            None => self.filters.clone(),
+        };
+        let report = RunReportState::new(RunInputs {
+            mode: match self.mode {
+                GatherMode::Collect => "collect".to_string(),
+                GatherMode::Record => "record".to_string(),
+            },
+            source: self.settings.source_description(),
+            context: self.settings.context_name(),
+            output_path: self.settings.file.clone().unwrap_or_default().to_string(),
+            output_encoding: self.settings.output_encoding_name(),
+            oci_reference: self
+                .settings
+                .oci
+                .reference
+                .clone()
+                .map(|reference| Reference::from(reference).to_string()),
+            clean_output: self.settings.clean_output_enabled(),
+            duration: self.settings.duration.unwrap_or_default().to_string(),
+            list_page_limit: self.settings.list_page_limit_value(),
+            collect_concurrency: self.settings.collect_concurrency_value(),
+            log_collect_concurrency: self.settings.log_collect_concurrency_value(),
+            node_log_mode: self.settings.node_log_mode_value().to_string(),
+            debug_pod_image: self.settings.debug_pod.image.clone(),
+            systemd_units: self.settings.systemd_units.clone(),
+            additional_logs: self
+                .additional_logs
+                .logs
+                .clone()
+                .into_iter()
+                .chain(self.additional_logs.additional_logs.clone().into_iter())
+                .map(|log| InputLog {
+                    name: log.name,
+                    command: log.command,
+                })
+                .collect(),
+            filters,
+            secret_env_names: self.settings.secrets.clone(),
+            secrets_file: self
+                .settings
+                .secrets_file
+                .clone()
+                .map(|file| file.0.display().to_string()),
+        });
 
         Ok(Config {
             client: self.client().await?,
@@ -1026,7 +1197,8 @@ impl GatherCommands {
             duration: self.settings.duration.unwrap_or_default(),
             systemd_units: self.settings.systemd_units.clone(),
             debug_pod: self.settings.debug_pod.clone(),
-            disable_additional_logs: self.additional_logs.disable,
+            disable_additional_logs: self.additional_logs.disable
+                || self.settings.node_log_mode_value() == NodeLogMode::Disabled,
             skip_logs_collection: self
                 .filter
                 .as_ref()
@@ -1037,12 +1209,99 @@ impl GatherCommands {
                 .as_ref()
                 .map(|f| f.skip_events_collection)
                 .unwrap_or_default(),
+            node_log_mode: self.settings.node_log_mode_value(),
+            tuning: self.settings.tuning(),
+            report: Arc::new(tokio::sync::Mutex::new(report)),
         })
     }
 
     async fn client(&self) -> anyhow::Result<Client> {
         self.settings.client().await
     }
+}
+
+impl GatherSettings {
+    fn source_description(&self) -> String {
+        match &self.kubeconfig_secret {
+            Some(secret) => match (
+                &secret.kubeconfig_secret_label,
+                &secret.kubeconfig_secret_name,
+            ) {
+                (Some(label), _) => format!("kubeconfig-secret-label:{}", label.0),
+                (_, Some(name)) => format!("kubeconfig-secret-name:{:?}", name.0),
+                (None, None) => "default".to_string(),
+            },
+            None => match &self.kubeconfig {
+                Some(_) => "kubeconfig-file".to_string(),
+                None => "default-or-in-cluster".to_string(),
+            },
+        }
+    }
+
+    fn context_name(&self) -> Option<String> {
+        self.kubeconfig
+            .as_ref()
+            .and_then(|kubeconfig| kubeconfig.0.current_context.clone())
+    }
+
+    fn output_encoding_name(&self) -> String {
+        if self.oci.reference.is_some() {
+            "oci".to_string()
+        } else {
+            match self.encoding.clone().unwrap_or_default() {
+                Encoding::Path => "path".to_string(),
+                Encoding::Gzip => "gzip".to_string(),
+                Encoding::Zip => "zip".to_string(),
+                Encoding::Oci(_) => "oci".to_string(),
+            }
+        }
+    }
+
+    fn tuning(&self) -> crate::gather::config::CollectionTuning {
+        crate::gather::config::CollectionTuning {
+            list_page_limit: self.list_page_limit_value(),
+            collect_concurrency: self.collect_concurrency_value(),
+            log_collect_concurrency: self.log_collect_concurrency_value(),
+        }
+    }
+
+    fn clean_output_enabled(&self) -> bool {
+        self.clean_output.unwrap_or(false)
+    }
+
+    fn list_page_limit_value(&self) -> u32 {
+        self.list_page_limit
+            .unwrap_or(default_list_page_limit())
+            .max(1)
+    }
+
+    fn collect_concurrency_value(&self) -> usize {
+        self.collect_concurrency
+            .unwrap_or(default_collect_concurrency())
+            .max(1)
+    }
+
+    fn log_collect_concurrency_value(&self) -> usize {
+        self.log_collect_concurrency
+            .unwrap_or(default_log_collect_concurrency())
+            .max(1)
+    }
+
+    fn node_log_mode_value(&self) -> NodeLogMode {
+        self.node_log_mode.unwrap_or_default()
+    }
+}
+
+const fn default_list_page_limit() -> u32 {
+    100
+}
+
+const fn default_collect_concurrency() -> usize {
+    32
+}
+
+const fn default_log_collect_concurrency() -> usize {
+    8
 }
 
 impl From<&GatherCommands> for FilterGroup {
@@ -1683,5 +1942,57 @@ mod tests {
         let result =
             GatherCommands::try_from(tmp_dir.path().join("invalid.yaml").to_str().unwrap());
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn to_writer_cleans_existing_path_output() {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let archive_path = tmp_dir.path().join("collect");
+        fs::create_dir_all(archive_path.join("stale"))
+            .await
+            .expect("create stale output");
+        fs::write(archive_path.join("stale").join("old.txt"), "old")
+            .await
+            .expect("write stale file");
+
+        let settings = GatherSettings {
+            file: Some(archive_path.clone().into()),
+            clean_output: Some(true),
+            ..Default::default()
+        };
+
+        let _writer = settings.to_writer().await.expect("writer");
+
+        assert!(
+            !archive_path.join("stale").exists(),
+            "expected clean output to remove stale directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn to_writer_refuses_to_clean_current_directory() {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let current_dir = env::current_dir().expect("cwd");
+        env::set_current_dir(tmp_dir.path()).expect("switch cwd");
+
+        let settings = GatherSettings {
+            file: Some(".".into()),
+            clean_output: Some(true),
+            ..Default::default()
+        };
+
+        let result = settings.to_writer().await;
+
+        env::set_current_dir(current_dir).expect("restore cwd");
+        assert!(result.is_err());
+        let error = match result {
+            Ok(_) => panic!("expected current directory cleanup to fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to clean unsafe output path")
+        );
     }
 }

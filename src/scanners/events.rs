@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{ArchivePath, Representation},
     writer::Writer,
 };
@@ -53,6 +54,14 @@ impl Collect<Event> for Events {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn path(&self, _: &Event) -> ArchivePath {
         ArchivePath::Custom("event-filter.html".into())
     }
@@ -62,6 +71,10 @@ impl Collect<Event> for Events {
             return Ok(false);
         }
         self.collectable.filter(obj)
+    }
+
+    fn collector_name(&self) -> String {
+        "v1/Event/html".to_string()
     }
 
     /// Generates an HTML table representations for an Event object.
@@ -144,14 +157,18 @@ impl Collect<Event> for Events {
 
     #[instrument(skip_all, err)]
     async fn collect(&self) -> anyhow::Result<()> {
+        let collector = self.collector_name();
+        let events = self.list().await?;
+        let event_count = events.len();
         let mut data = String::new();
-        for obj in self.list().await? {
+        for obj in events {
             for repr in self.representations(&obj).await? {
                 data.push_str(repr.data());
             }
         }
 
-        self.get_writer()
+        if let Err(error) = self
+            .get_writer()
             .lock()
             .await
             .store(
@@ -160,5 +177,21 @@ impl Collect<Event> for Events {
                     .with_data(format!(include_str!("templates/event-filter.html"), data).as_str()),
             )
             .await
+        {
+            self.get_report().lock().await.record_failure(
+                "store",
+                collector.clone(),
+                None,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+
+        self.get_report()
+            .lock()
+            .await
+            .record_success(&collector, event_count, 1);
+
+        Ok(())
     }
 }

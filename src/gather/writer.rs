@@ -274,13 +274,11 @@ impl Writer {
                 ..
             }) => {
                 let file = archive.join(archive_path);
-                if !file.exists() {
-                    DirBuilder::new()
-                        .recursive(true)
-                        .create(file.parent().unwrap())?;
-                    let mut file = File::create(file)?;
-                    file.write_all(data.as_bytes())?;
-                }
+                DirBuilder::new()
+                    .recursive(true)
+                    .create(file.parent().unwrap())?;
+                let mut file = File::create(file)?;
+                file.write_all(data.as_bytes())?;
             }
             Self::Gzip(Archive(archive), builder) => {
                 let mut header = Header::new_gnu();

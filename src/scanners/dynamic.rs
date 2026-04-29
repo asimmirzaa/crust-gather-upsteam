@@ -7,7 +7,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{Representation, TypeMetaGetter},
     writer::Writer,
 };
@@ -38,6 +39,14 @@ impl Collect<DynamicObject> for Dynamic {
 
     fn get_writer(&self) -> Arc<Mutex<Writer>> {
         self.collectable.get_writer()
+    }
+
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
     }
 
     fn filter(&self, obj: &DynamicObject) -> Result<bool, CollectError> {
@@ -180,6 +189,11 @@ mod test {
                     disable_additional_logs: false,
                     skip_logs_collection: false,
                     skip_events_collection: false,
+                    node_log_mode: crate::cli::NodeLogMode::Deep,
+                    tuning: Default::default(),
+                    report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::gather::report::RunReportState::default(),
+                    )),
                 },
                 ApiResource::erase::<Pod>(&()),
             ),

@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::instrument;
 
-use crate::cli::DebugPod;
+use crate::cli::{DebugPod, NodeLogMode};
 use crate::filters::filter::FilterGroup;
 use crate::scanners::dynamic::Dynamic;
 use crate::scanners::events::Events;
@@ -32,7 +32,8 @@ use crate::scanners::interface::Collect;
 use crate::scanners::logs::{LogSelection, Logs};
 use crate::scanners::versions::Versions;
 
-use super::representation::{CustomLog, NamespaceName, Representation};
+use super::report::RunReportState;
+use super::representation::{ArchivePath, CustomLog, NamespaceName, Representation};
 use super::writer::Writer;
 
 #[derive(Default, Clone, Debug)]
@@ -356,6 +357,23 @@ pub enum GatherMode {
     Record,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CollectionTuning {
+    pub list_page_limit: u32,
+    pub collect_concurrency: usize,
+    pub log_collect_concurrency: usize,
+}
+
+impl Default for CollectionTuning {
+    fn default() -> Self {
+        Self {
+            list_page_limit: 100,
+            collect_concurrency: 32,
+            log_collect_concurrency: 8,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub client: Client,
@@ -367,56 +385,78 @@ pub struct Config {
     pub duration: RunDuration,
     pub systemd_units: Vec<String>,
     pub debug_pod: DebugPod,
-
     pub disable_additional_logs: bool,
     pub skip_logs_collection: bool,
     pub skip_events_collection: bool,
+    pub node_log_mode: NodeLogMode,
+    pub tuning: CollectionTuning,
+    pub report: Arc<Mutex<RunReportState>>,
 }
 
 impl Config {
     /// Collect representations for resources from discovery to the specified archive file.
     #[instrument(skip_all, err)]
     pub async fn collect(&self) -> anyhow::Result<()> {
-        let discovery = match discovery::Discovery::new(self.client.clone())
-            .run_aggregated()
-            .await
-        {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "Aggregated discovery failed, falling back to standard discovery"
-                );
-                discovery::Discovery::new(self.client.clone()).run().await?
-            }
-        };
+        let collection_result = async {
+            let discovery = match discovery::Discovery::new(self.client.clone())
+                .run_aggregated()
+                .await
+            {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Aggregated discovery failed, falling back to standard discovery"
+                    );
+                    discovery::Discovery::new(self.client.clone()).run().await?
+                }
+            };
 
-        let mode = match self.mode {
-            GatherMode::Collect => LIST,
-            GatherMode::Record => WATCH,
-        };
-        let collectables = discovery
-            .groups()
-            .flat_map(|r| r.resources_by_stability())
-            .filter_map(|r| r.1.supports_operation(mode).then_some(r.0.into()))
-            .flat_map(|group: Group| group.into_collectable(self.clone()));
+            let mode = match self.mode {
+                GatherMode::Collect => LIST,
+                GatherMode::Record => WATCH,
+            };
+            let collectables = discovery
+                .groups()
+                .flat_map(|r| r.resources_by_stability())
+                .filter_map(|r| r.1.supports_operation(mode).then_some(r.0.into()))
+                .flat_map(|group: Group| group.into_collectable(self.clone()));
 
-        match self.mode {
-            GatherMode::Collect => {
-                tracing::info!("Collecting resources...");
-                timeout(
-                    self.duration.0.into(),
-                    self.iterate_until_completion(collectables),
-                )
-                .await?
-            }
-            GatherMode::Record => {
-                tracing::info!("Recording resources...");
-                self.iterate_until_completion(collectables).await;
+            match self.mode {
+                GatherMode::Collect => {
+                    tracing::info!("Collecting resources...");
+                    timeout(
+                        self.duration.0.into(),
+                        self.iterate_until_completion(collectables),
+                    )
+                    .await?
+                }
+                GatherMode::Record => {
+                    tracing::info!("Recording resources...");
+                    self.iterate_until_completion(collectables).await
+                }
             }
         }
+        .await;
 
-        self.finish().await
+        if let Err(error) = &collection_result {
+            self.report
+                .lock()
+                .await
+                .record_failure("collection", "run", None, error.to_string());
+        }
+
+        self.write_run_artifacts(collection_result.is_ok()).await?;
+        let finish_result = self.finish().await;
+
+        match (collection_result, finish_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(collection_error), Err(finish_error)) => Err(anyhow::anyhow!(
+                "collection failed: {collection_error}; archive finalization failed: {finish_error}"
+            )),
+        }
     }
 
     async fn finish(&self) -> anyhow::Result<()> {
@@ -427,8 +467,60 @@ impl Config {
         Ok(())
     }
 
-    async fn iterate_until_completion(&self, collectables: impl Iterator<Item = Collectable>) {
-        join_all(collectables.map(|c| async move { c.collect().await })).await;
+    async fn iterate_until_completion(
+        &self,
+        collectables: impl Iterator<Item = Collectable>,
+    ) -> anyhow::Result<()> {
+        let results = join_all(collectables.map(|c| async move { c.collect().await })).await;
+        let errors = results
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "collection failed for {} collector(s): {}",
+            errors.len(),
+            errors.into_iter().take(3).collect::<Vec<_>>().join("; "),
+        ))
+    }
+
+    async fn write_run_artifacts(&self, success: bool) -> anyhow::Result<()> {
+        let (report, stats, failures, warnings) = {
+            let mut report = self.report.lock().await;
+            report.finalize(success);
+            (
+                serde_saphyr::to_string(report.report())?,
+                serde_saphyr::to_string(report.stats())?,
+                serde_saphyr::to_string(report.failures())?,
+                serde_saphyr::to_string(report.warnings())?,
+            )
+        };
+
+        let artifacts = [
+            ("run-report.yaml", report),
+            ("run-stats.yaml", stats),
+            ("run-failures.yaml", failures),
+            ("run-warnings.yaml", warnings),
+        ];
+
+        let writer = self.writer.clone();
+        let mut writer = writer.lock().await;
+        for (path, data) in artifacts {
+            writer
+                .store(
+                    &Representation::new()
+                        .with_path(ArchivePath::Custom(path.into()))
+                        .with_data(data.as_str()),
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -463,7 +555,7 @@ enum Collectable {
 }
 
 impl Collectable {
-    async fn collect(&self) {
+    async fn collect(&self) -> anyhow::Result<()> {
         match self {
             Self::WatchDynamic(o) => o.watch_retry(),
             Self::Dynamic(o) => o.collect_retry(),
@@ -473,7 +565,7 @@ impl Collectable {
             Self::Info(i) => i.collect_retry(),
             Self::Versions(v) => v.collect_retry(),
         }
-        .await;
+        .await
     }
 }
 
@@ -622,6 +714,11 @@ mod tests {
             disable_additional_logs: false,
             skip_logs_collection: false,
             skip_events_collection: false,
+            node_log_mode: crate::cli::NodeLogMode::Deep,
+            tuning: Default::default(),
+            report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::gather::report::RunReportState::default(),
+            )),
         };
 
         // Gzip archive is failing due to timeout.
@@ -662,6 +759,11 @@ mod tests {
             disable_additional_logs: false,
             skip_logs_collection: false,
             skip_events_collection: false,
+            node_log_mode: crate::cli::NodeLogMode::Deep,
+            tuning: Default::default(),
+            report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::gather::report::RunReportState::default(),
+            )),
         };
 
         let result = config.collect().await;
@@ -682,7 +784,7 @@ mod tests {
             client,
             filter: Arc::new(FilterGroup(vec![FilterList(vec![])])),
             writer: Writer::new(
-                &Archive::new(file_path),
+                &Archive::new(file_path.clone()),
                 &Encoding::Path,
                 None,
                 None,
@@ -700,9 +802,18 @@ mod tests {
             disable_additional_logs: false,
             skip_logs_collection: false,
             skip_events_collection: false,
+            node_log_mode: crate::cli::NodeLogMode::Deep,
+            tuning: Default::default(),
+            report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::gather::report::RunReportState::default(),
+            )),
         };
 
         let result = config.collect().await;
         assert!(result.is_ok());
+        assert!(file_path.join("run-report.yaml").is_file());
+        assert!(file_path.join("run-stats.yaml").is_file());
+        assert!(file_path.join("run-failures.yaml").is_file());
+        assert!(file_path.join("run-warnings.yaml").is_file());
     }
 }

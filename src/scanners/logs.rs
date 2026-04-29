@@ -15,7 +15,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{ArchivePath, Container, LogGroup, Representation},
     writer::Writer,
 };
@@ -23,9 +24,8 @@ use crate::gather::{
 use super::{
     interface::{Collect, CollectError},
     objects::Objects,
+    pod_support::pod_container_refs,
 };
-
-const LOG_COLLECT_CONCURRENCY: usize = 8;
 
 /// Failure to collect logs
 #[derive(Debug, Error)]
@@ -100,8 +100,16 @@ impl Collect<Pod> for Logs {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn collect_concurrency(&self) -> usize {
-        LOG_COLLECT_CONCURRENCY
+        self.get_tuning().log_collect_concurrency.max(1)
     }
 
     fn filter(&self, obj: &Pod) -> Result<bool, CollectError> {
@@ -111,14 +119,26 @@ impl Collect<Pod> for Logs {
         self.collectable.filter(obj)
     }
 
+    fn collector_name(&self) -> String {
+        match self.group {
+            LogSelection::Current => "v1/Pod/current-logs".to_string(),
+            LogSelection::Previous => "v1/Pod/previous-logs".to_string(),
+        }
+    }
+
     /// Collects container logs representations.
     #[instrument(skip_all, fields(name = pod.name_any(), namespace = pod.namespace(), group=self.group.to_string()), err)]
     async fn representations(&self, pod: &Pod) -> anyhow::Result<Vec<Representation>> {
         tracing::debug!("Collecting logs");
 
         let mut representations = vec![];
+        let collector = self.collector_name();
+        let pod_ref = pod
+            .namespace()
+            .map(|namespace| format!("{namespace}/{}", pod.name_any()))
+            .unwrap_or_else(|| pod.name_any());
 
-        for container in pod.spec.clone().unwrap().containers {
+        for container in pod_container_refs(pod) {
             let Some(logs) = normalize_logs_result(
                 Api::<Pod>::namespaced(
                     self.get_api().into(),
@@ -136,7 +156,19 @@ impl Collect<Pod> for Logs {
                 .await,
             )?
             else {
-                tracing::debug!(container = container.name.as_str(), "No logs found");
+                if matches!(self.group, LogSelection::Current) {
+                    self.get_report().lock().await.record_warning(
+                        "logs",
+                        collector.clone(),
+                        Some(format!("{pod_ref}:{}", container.name)),
+                        format!("No {} logs found for {}", self.group, container.kind),
+                    );
+                }
+                tracing::debug!(
+                    container = container.name.as_str(),
+                    container_kind = %container.kind,
+                    "No logs found"
+                );
                 continue;
             };
 
@@ -146,8 +178,12 @@ impl Collect<Pod> for Logs {
                         pod,
                         TypeMeta::resource::<Pod>(),
                         match self.group {
-                            LogSelection::Current => LogGroup::Current(Container(container.name)),
-                            LogSelection::Previous => LogGroup::Previous(Container(container.name)),
+                            LogSelection::Current => {
+                                LogGroup::Current(Container(container.name.clone()))
+                            }
+                            LogSelection::Previous => {
+                                LogGroup::Previous(Container(container.name.clone()))
+                            }
                         },
                     ))
                     .with_data(logs.as_str()),
@@ -295,6 +331,13 @@ mod test {
                 systemd_units: Default::default(),
                 debug_pod: Default::default(),
                 disable_additional_logs: false,
+                skip_logs_collection: false,
+                skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
             }),
             group: LogSelection::Current,
         }
