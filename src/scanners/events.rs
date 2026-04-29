@@ -61,7 +61,7 @@ impl Collect<Event> for Events {
 
     /// Generates an HTML table representations for an Event object.
     async fn representations(&self, event: &Event) -> anyhow::Result<Vec<Representation>> {
-        tracing::info!("Collecting events");
+        tracing::debug!("Collecting event row");
 
         let mut representations = vec![];
         let row = TableRow::new()

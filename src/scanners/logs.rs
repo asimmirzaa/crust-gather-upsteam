@@ -130,7 +130,7 @@ impl Collect<Pod> for Logs {
                 .await,
             )?
             else {
-                tracing::info!(container = container.name.as_str(), "No logs found");
+                tracing::debug!(container = container.name.as_str(), "No logs found");
                 continue;
             };
 
