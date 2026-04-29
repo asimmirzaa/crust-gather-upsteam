@@ -68,12 +68,9 @@ pub struct Cli {
 
 impl Cli {
     pub fn init(&self) {
-        let fmt_layer = if matches!(self.command, Commands::Mcp) {
-            // The MCP transport owns stdout, so logs must go to stderr in this mode.
-            fmt::layer().with_writer(std::io::stderr).boxed()
-        } else {
-            fmt::layer().boxed()
-        };
+        // CLI result payloads should remain clean when redirected to stdout, so
+        // logs always go to stderr.
+        let fmt_layer = fmt::layer().with_writer(std::io::stderr).boxed();
 
         tracing_subscriber::registry()
             .with(fmt_layer)

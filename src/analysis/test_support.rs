@@ -48,7 +48,7 @@ pub fn sample_snapshot(name: &str) -> anyhow::Result<SampleSnapshot> {
     let report = RunReport {
         identity: RunIdentity {
             collector_name: "crust-gather".into(),
-            collector_version: "1.0.0".into(),
+            collector_version: "1.0.1".into(),
             collector_revision: "test-revision".into(),
         },
         inputs: RunInputs {
