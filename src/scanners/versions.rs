@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{ArchivePath, Representation},
     writer::Writer,
 };
@@ -17,6 +18,7 @@ use crate::gather::{
 use super::{
     interface::{Collect, CollectError},
     objects::Objects,
+    pod_support::pod_container_refs,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -24,6 +26,7 @@ struct Version {
     name: String,
     namespace: String,
     container: String,
+    container_type: String,
     version: String,
 }
 
@@ -50,36 +53,71 @@ impl Collect<Pod> for Versions {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn filter(&self, _: &Pod) -> Result<bool, CollectError> {
         Ok(true)
     }
 
+    fn collector_name(&self) -> String {
+        "app-versions".to_string()
+    }
+
     #[instrument(skip_all, err)]
     async fn collect(&self) -> anyhow::Result<()> {
+        let collector = self.collector_name();
         let pods = self.list().await?;
+        let pod_count = pods.len();
 
         let data = pods
             .iter()
-            .filter_map(|pod| pod.spec.clone().map(|s| (pod.meta(), s)))
-            .flat_map(|(meta, spec)| {
-                spec.containers.into_iter().map(|container| Version {
-                    name: meta.name.clone().unwrap_or_default(),
-                    namespace: meta.namespace.clone().unwrap_or_default(),
-                    container: container.name.clone(),
-                    version: container.image.clone().unwrap_or_default(),
-                })
+            .flat_map(|pod| {
+                let meta = pod.meta().clone();
+                pod_container_refs(pod)
+                    .into_iter()
+                    .map(move |container| Version {
+                        name: meta.name.clone().unwrap_or_default(),
+                        namespace: meta.namespace.clone().unwrap_or_default(),
+                        container: container.name.clone(),
+                        container_type: container.kind.to_string(),
+                        version: container.image.unwrap_or_default(),
+                    })
             })
             .collect::<Vec<_>>();
 
-        self.get_writer()
+        let payload = serde_yaml::to_string(&data)?;
+        if let Err(error) = self
+            .get_writer()
             .lock()
             .await
             .store(
                 &Representation::new()
                     .with_path(ArchivePath::Custom("app-versions.yaml".into()))
-                    .with_data(serde_yaml::to_string(&data)?.as_str()),
+                    .with_data(payload.as_str()),
             )
             .await
+        {
+            self.get_report().lock().await.record_failure(
+                "store",
+                collector.clone(),
+                None,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+
+        self.get_report()
+            .lock()
+            .await
+            .record_success(&collector, pod_count, 1);
+
+        Ok(())
     }
 
     fn get_api(&self) -> Api<Pod> {
@@ -187,6 +225,7 @@ mod tests {
             r"- name: test
   namespace: default
   container: test
+  container_type: app
   version: test
 "
             .to_string()

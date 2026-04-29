@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use trait_set::trait_set;
 
-use crate::gather::config::Secrets;
+use crate::gather::config::{CollectionTuning, Secrets};
+use crate::gather::report::RunReportState;
 use crate::gather::representation::{ArchivePath, Representation, TypeMetaGetter};
 use crate::gather::writer::Writer;
 
@@ -61,8 +62,6 @@ pub enum WatchError {
 pub const ADDED_ANNOTATION: &str = "crust-gather.io/added";
 pub const UPDATED_ANNOTATION: &str = "crust-gather.io/updated";
 pub const DELETED_ANNOTATION: &str = "crust-gather.io/deleted";
-const DEFAULT_LIST_PAGE_LIMIT: u32 = 100;
-const DEFAULT_COLLECT_CONCURRENCY: usize = 32;
 
 #[async_trait]
 /// Collect defines a trait for collecting Kubernetes object representations.
@@ -70,6 +69,13 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// Default retry policy - exponential backoff.
     /// Starts at 10ms, doubles each iteration, up to max of 60s.
     fn retry_policy() -> ExponentialBuilder {
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(10))
+            .with_max_delay(Duration::from_secs(60))
+            .with_max_times(8)
+    }
+
+    fn watch_retry_policy() -> ExponentialBuilder {
         ExponentialBuilder::default()
             .with_min_delay(Duration::from_millis(10))
             .with_max_delay(Duration::from_secs(60))
@@ -91,6 +97,12 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// Returns the Writer instance for this scanner to write object
     /// representations to.
     fn get_writer(&self) -> Arc<Mutex<Writer>>;
+
+    /// Returns the run report state for recording collection statistics.
+    fn get_report(&self) -> Arc<Mutex<RunReportState>>;
+
+    /// Returns collection tuning values.
+    fn get_tuning(&self) -> CollectionTuning;
 
     /// Constructs the path for storing the collected Kubernetes object.
     ///
@@ -142,6 +154,11 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
         ListParams::default()
     }
 
+    fn collector_name(&self) -> String {
+        let type_meta = self.resource().to_type_meta();
+        format!("{}/{}", type_meta.api_version, type_meta.kind)
+    }
+
     /// Returns the TypeMetaGetter for the API resource type this scanner handles.
     /// Used to set the TypeMeta on the returned objects in the list,
     /// as the API server does not provide this data in the response.
@@ -152,7 +169,7 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// Scanners can override this to reduce pressure on expensive API paths such
     /// as pod log streaming.
     fn collect_concurrency(&self) -> usize {
-        DEFAULT_COLLECT_CONCURRENCY
+        self.get_tuning().collect_concurrency
     }
 
     /// Lists Kubernetes objects of the type handled by this scanner, and set
@@ -161,16 +178,35 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     #[instrument(skip_all, fields(kind = self.resource().to_type_meta().kind, apiVersion = self.resource().to_type_meta().api_version), err)]
     async fn list(&self) -> anyhow::Result<Vec<R>> {
         let mut params = self.list_params();
-        params.limit.get_or_insert(DEFAULT_LIST_PAGE_LIMIT);
+        params
+            .limit
+            .get_or_insert(self.get_tuning().list_page_limit);
 
         let mut objects = vec![];
+        let collector = self.collector_name();
 
         loop {
-            let data = self
-                .get_api()
-                .list(&params)
+            let data = match self
+                .retry(|| async {
+                    self.get_api()
+                        .list(&params)
+                        .await
+                        .map_err(CollectError::List)
+                        .map_err(anyhow::Error::from)
+                })
                 .await
-                .map_err(CollectError::List)?;
+            {
+                Ok(data) => data,
+                Err(error) => {
+                    self.get_report().lock().await.record_failure(
+                        "list",
+                        collector.clone(),
+                        None,
+                        error.to_string(),
+                    );
+                    return Err(error);
+                }
+            };
 
             objects.extend(
                 data.items
@@ -184,6 +220,11 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
             }
         }
 
+        self.get_report()
+            .lock()
+            .await
+            .record_listed(&collector, objects.len());
+
         Ok(objects)
     }
 
@@ -192,6 +233,7 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     async fn collect(&self) -> anyhow::Result<()> {
         let objects = self.list().await?;
         let kind = self.resource().to_type_meta().kind;
+        let collector = self.collector_name();
         let collect_tasks = objects.into_iter().map(|object| {
             let kind = kind.clone();
             let object_name = object.name_any();
@@ -203,6 +245,7 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
             async move {
                 self.write_with_retry(&object)
                     .await
+                    .map(|written_files| (object_ref.clone(), written_files))
                     .with_context(|| format!("failed to collect {kind} {object_ref}"))
             }
         });
@@ -213,8 +256,23 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
         let mut errors = vec![];
 
         while let Some(result) = collect_tasks.next().await {
-            if let Err(err) = result {
-                errors.push(err);
+            match result {
+                Ok((object_ref, written_files)) => {
+                    self.get_report()
+                        .lock()
+                        .await
+                        .record_success(&collector, 1, written_files);
+                    tracing::debug!(object = object_ref, written_files, "Collected object");
+                }
+                Err(err) => {
+                    self.get_report().lock().await.record_failure(
+                        "collect",
+                        collector.clone(),
+                        None,
+                        err.to_string(),
+                    );
+                    errors.push(err);
+                }
             }
         }
 
@@ -238,39 +296,32 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
 
     /// Retries collecting representations using an exponential backoff with jitter.
     /// This helps handle transient errors and spreading load.
-    async fn collect_retry(&self) {
-        (|| async { self.collect().await })
-            .retry(Self::retry_policy())
-            .await
-            .unwrap();
-    }
-
-    /// Retries watching representations using an exponential backoff with jitter.
-    /// This helps handle transient errors and spreading load.
-    async fn watch_retry(&self) {
+    async fn watch_retry(&self) -> anyhow::Result<()> {
         (|| async { self.watch_collect().await })
-            .retry(Self::retry_policy())
+            .retry(Self::watch_retry_policy())
             .await
-            .unwrap();
+            .map_err(anyhow::Error::from)
     }
 
     /// Retries collecting representations using an exponential backoff with jitter.
     /// This helps handle transient errors and spreading load.
-    async fn write_with_retry(&self, object: &R) -> anyhow::Result<()> {
+    async fn write_with_retry(&self, object: &R) -> anyhow::Result<usize> {
         let representations = self
             .retry(|| async { self.representations(object).await })
             .await?;
 
         let writer = self.get_writer();
+        let mut written_files = 0;
         for repr in representations {
             writer
                 .lock()
                 .await
                 .store(&self.get_secrets().strip(&repr))
                 .await?;
+            written_files += 1;
         }
 
-        Ok(())
+        Ok(written_files)
     }
 
     /// Collect objects from watch events, storing difference from original as a series of json pathes
@@ -353,7 +404,8 @@ mod tests {
     use tokio::time::sleep;
 
     use crate::cli::DEFAULT_OCI_BUFFER_SIZE;
-    use crate::gather::config::Secrets;
+    use crate::gather::config::{CollectionTuning, Secrets};
+    use crate::gather::report::RunReportState;
     use crate::gather::representation::{ArchivePath, Representation};
     use crate::gather::writer::{Archive, Encoding, Writer};
 
@@ -377,6 +429,7 @@ mod tests {
     struct ConcurrencyCollector {
         objects: Vec<Pod>,
         writer: Arc<Mutex<Writer>>,
+        report: Arc<Mutex<RunReportState>>,
         current_in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         concurrency: usize,
@@ -385,6 +438,7 @@ mod tests {
     struct StoreFailingCollector {
         objects: Vec<Pod>,
         writer: Arc<Mutex<Writer>>,
+        report: Arc<Mutex<RunReportState>>,
     }
 
     #[async_trait]
@@ -395,6 +449,14 @@ mod tests {
 
         fn get_writer(&self) -> Arc<Mutex<Writer>> {
             self.writer.clone()
+        }
+
+        fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+            self.report.clone()
+        }
+
+        fn get_tuning(&self) -> CollectionTuning {
+            CollectionTuning::default()
         }
 
         fn filter(&self, _object: &Pod) -> Result<bool, CollectError> {
@@ -445,6 +507,14 @@ mod tests {
             self.writer.clone()
         }
 
+        fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+            self.report.clone()
+        }
+
+        fn get_tuning(&self) -> CollectionTuning {
+            CollectionTuning::default()
+        }
+
         fn filter(&self, _object: &Pod) -> Result<bool, CollectError> {
             Ok(true)
         }
@@ -490,6 +560,7 @@ mod tests {
                 })
                 .collect(),
             writer: test_writer("collect-concurrency-test").await,
+            report: Arc::new(Mutex::new(RunReportState::default())),
             current_in_flight: Arc::new(AtomicUsize::new(0)),
             max_in_flight: Arc::new(AtomicUsize::new(0)),
             concurrency: 2,
@@ -515,6 +586,7 @@ mod tests {
                 })
                 .collect(),
             writer: test_writer("collect-error-test").await,
+            report: Arc::new(Mutex::new(RunReportState::default())),
         };
 
         let err = collector

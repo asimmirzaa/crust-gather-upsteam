@@ -24,7 +24,8 @@ use tracing::instrument;
 use crate::{
     cli::DebugPod,
     gather::{
-        config::{Config, Secrets},
+        config::{CollectionTuning, Config, Secrets},
+        report::RunReportState,
         representation::{ArchivePath, LogGroup, Representation},
         writer::Writer,
     },
@@ -78,8 +79,20 @@ impl Collect<Node> for Nodes {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn filter(&self, obj: &Node) -> Result<bool, CollectError> {
         self.collectable.filter(obj)
+    }
+
+    fn collector_name(&self) -> String {
+        "node-kubelet-logs".to_string()
     }
 
     /// Collects container logs representations.

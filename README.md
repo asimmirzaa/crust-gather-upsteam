@@ -44,6 +44,31 @@ helm upgrade --install crust-gather oci://ghcr.io/crust-gather/crust-gather \
   --set reference=ttl.sh/my-cluster-snapshot:1h
 ```
 
+By default the chart now runs in a safer mode:
+
+- `collect.nodeLogMode=disabled` avoids privileged node-debug pods.
+- A generated read-only `ClusterRole` is bound to the ServiceAccount instead of
+  `cluster-admin`.
+- The job workspace is limited with `job.outputVolumeSizeLimit=2Gi`.
+- The job writes into `job.outputPath=/apps/crust-gather/output`, so
+  `--clean-output` can safely remove stale contents without targeting the
+  mounted volume root.
+
+If you need host-level kubelet or custom node log collection, opt in explicitly:
+
+```bash
+helm upgrade --install crust-gather oci://ghcr.io/crust-gather/crust-gather \
+  --set reference=ttl.sh/my-cluster-snapshot:1h \
+  --set collect.nodeLogMode=deep
+```
+
+Each collected snapshot now also contains:
+
+- `run-report.yaml`
+- `run-stats.yaml`
+- `run-failures.yaml`
+- `run-warnings.yaml`
+
 After helm install completes, the OCI archve can be served directly from a docker container:
 
 ```bash

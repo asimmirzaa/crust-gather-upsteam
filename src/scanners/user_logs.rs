@@ -22,7 +22,8 @@ use tracing::instrument;
 use crate::{
     cli::DebugPod,
     gather::{
-        config::{Config, Secrets},
+        config::{CollectionTuning, Config, Secrets},
+        report::RunReportState,
         representation::{ArchivePath, CustomLog, LogGroup, Representation},
         writer::Writer,
     },
@@ -68,8 +69,20 @@ impl Collect<Node> for UserLogs {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn filter(&self, obj: &Node) -> Result<bool, CollectError> {
         self.collectable.filter(obj)
+    }
+
+    fn collector_name(&self) -> String {
+        "node-custom-logs".to_string()
     }
 
     /// Collects container logs representations.
@@ -159,7 +172,7 @@ impl UserLogs {
             let representation = self
                 .get_representation(
                     pod_name.as_str(),
-                    custom_log.command.split_ascii_whitespace().collect(),
+                    vec!["sh", "-c", custom_log.command.as_str()],
                     ArchivePath::logs_path(
                         node,
                         TypeMeta::resource::<Node>(),
