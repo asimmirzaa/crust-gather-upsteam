@@ -490,10 +490,11 @@ impl Config {
     }
 
     async fn write_run_artifacts(&self, success: bool) -> anyhow::Result<()> {
-        let (report, stats, failures, warnings) = {
+        let (report_state, report, stats, failures, warnings) = {
             let mut report = self.report.lock().await;
             report.finalize(success);
             (
+                report.report().clone(),
                 serde_saphyr::to_string(report.report())?,
                 serde_saphyr::to_string(report.stats())?,
                 serde_saphyr::to_string(report.failures())?,
@@ -519,6 +520,14 @@ impl Config {
                 )
                 .await?;
         }
+        writer
+            .write_agent_artifacts(
+                &report_state,
+                &report_state.stats,
+                &report_state.failures,
+                &report_state.warnings,
+            )
+            .await?;
 
         Ok(())
     }
@@ -815,5 +824,10 @@ mod tests {
         assert!(file_path.join("run-stats.yaml").is_file());
         assert!(file_path.join("run-failures.yaml").is_file());
         assert!(file_path.join("run-warnings.yaml").is_file());
+        assert!(file_path.join("AGENT-START.md").is_file());
+        assert!(file_path.join("resource-index.jsonl").is_file());
+        assert!(file_path.join("relation-index.jsonl").is_file());
+        assert!(file_path.join("log-index.jsonl").is_file());
+        assert!(file_path.join("snapshot.sqlite").is_file());
     }
 }

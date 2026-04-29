@@ -51,6 +51,7 @@ unselector = "0.2.0"
 derive_more = { version = "2.1.1", features = ["deref"] }
 serde-saphyr = "0.0.27"
 scopeguard = "1.2.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [dev-dependencies]
 xid = "1.1.1"
