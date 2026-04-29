@@ -25,6 +25,8 @@ use super::{
     objects::Objects,
 };
 
+const LOG_COLLECT_CONCURRENCY: usize = 8;
+
 /// Failure to collect logs
 #[derive(Debug, Error)]
 #[error("Failed to collect logs: {0:?}")]
@@ -78,6 +80,14 @@ impl Logs {
     }
 }
 
+fn normalize_logs_result(result: Result<String, kube::Error>) -> Result<Option<String>, LogsError> {
+    match result {
+        Ok(logs) => Ok(Some(logs)),
+        Err(kube::Error::Api(status)) if status.code == 400 => Ok(None),
+        Err(err) => Err(LogsError(err)),
+    }
+}
+
 #[async_trait]
 impl Collect<Pod> for Logs {
     fn get_secrets(&self) -> Secrets {
@@ -86,6 +96,10 @@ impl Collect<Pod> for Logs {
 
     fn get_writer(&self) -> Arc<Mutex<Writer>> {
         self.collectable.get_writer()
+    }
+
+    fn collect_concurrency(&self) -> usize {
+        LOG_COLLECT_CONCURRENCY
     }
 
     fn filter(&self, obj: &Pod) -> Result<bool, CollectError> {
@@ -100,29 +114,25 @@ impl Collect<Pod> for Logs {
         let mut representations = vec![];
 
         for container in pod.spec.clone().unwrap().containers {
-            let logs = match Api::<Pod>::namespaced(
-                self.get_api().into(),
-                pod.namespace().unwrap_or_default().as_ref(),
-            )
-            .logs(
-                pod.name_any().as_str(),
-                &LogParams {
-                    container: Some(container.name.clone()),
-                    since_time: Some(Default::default()),
-                    ..self.group.clone().into()
-                },
-            )
-            .await
-            {
-                Ok(logs) => Ok(logs),
-                // If a 400 error occurs, returns the current representations, as that indicates no logs exist.
-                Err(kube::Error::Api(status)) if status.code == 400 => {
-                    tracing::info!("No logs found");
-                    return Ok(representations);
-                }
-                e => e,
-            }
-            .map_err(LogsError)?;
+            let Some(logs) = normalize_logs_result(
+                Api::<Pod>::namespaced(
+                    self.get_api().into(),
+                    pod.namespace().unwrap_or_default().as_ref(),
+                )
+                .logs(
+                    pod.name_any().as_str(),
+                    &LogParams {
+                        container: Some(container.name.clone()),
+                        since_time: Some(Default::default()),
+                        ..self.group.clone().into()
+                    },
+                )
+                .await,
+            )?
+            else {
+                tracing::info!(container = container.name.as_str(), "No logs found");
+                continue;
+            };
 
             representations.push(
                 Representation::new()
@@ -157,9 +167,11 @@ mod test {
     use std::time::Duration;
 
     use backon::{ConstantBuilder, Retryable};
-    use k8s_openapi::{api::core::v1::Pod, serde_json};
+    use k8s_openapi::{
+        api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ListMeta, serde_json,
+    };
     use kube::Api;
-    use kube::core::params::PostParams;
+    use kube::core::{Status, params::PostParams};
     use tempfile::TempDir;
     use tokio::time::timeout;
 
@@ -178,7 +190,39 @@ mod test {
         scanners::{interface::Collect, logs::LogSelection, objects::Objects},
     };
 
-    use super::Logs;
+    use super::{Logs, LogsError, normalize_logs_result};
+
+    #[test]
+    fn normalize_logs_result_treats_400_as_missing_logs() {
+        let status = Status {
+            code: 400,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+                .expect("missing logs to be ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_logs_result_preserves_other_api_errors() {
+        let status = Status {
+            code: 500,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        let err = normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+            .expect_err("500 should bubble");
+        let LogsError(kube::Error::Api(status)) = err else {
+            panic!("unexpected error variant");
+        };
+
+        assert_eq!(status.code, 500);
+    }
 
     #[tokio::test]
     async fn collect_logs() {

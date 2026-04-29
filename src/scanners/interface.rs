@@ -2,8 +2,7 @@ use anyhow;
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use chrono::Utc;
-use futures::future::join_all;
-use futures::{StreamExt, TryStreamExt as _};
+use futures::{StreamExt, TryStreamExt as _, stream};
 use k8s_openapi::serde_json;
 use kube::Api;
 use kube::api::WatchEvent;
@@ -63,6 +62,7 @@ pub const ADDED_ANNOTATION: &str = "crust-gather.io/added";
 pub const UPDATED_ANNOTATION: &str = "crust-gather.io/updated";
 pub const DELETED_ANNOTATION: &str = "crust-gather.io/deleted";
 const DEFAULT_LIST_PAGE_LIMIT: u32 = 100;
+const DEFAULT_COLLECT_CONCURRENCY: usize = 32;
 
 #[async_trait]
 /// Collect defines a trait for collecting Kubernetes object representations.
@@ -147,6 +147,14 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// as the API server does not provide this data in the response.
     fn resource(&self) -> impl TypeMetaGetter;
 
+    /// Returns the maximum number of object collection tasks to run at once.
+    ///
+    /// Scanners can override this to reduce pressure on expensive API paths such
+    /// as pod log streaming.
+    fn collect_concurrency(&self) -> usize {
+        DEFAULT_COLLECT_CONCURRENCY
+    }
+
     /// Lists Kubernetes objects of the type handled by this scanner, and set
     /// the get_type_meta() information on the objects. Objects are filtered
     /// before getting added to the result.
@@ -182,13 +190,15 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     /// Lists all object and collects representations for them.
     #[instrument(skip_all, err)]
     async fn collect(&self) -> anyhow::Result<()> {
-        join_all(
-            self.list()
-                .await?
-                .iter()
-                .map(|c| async { self.write_with_retry(c).await }),
-        )
-        .await;
+        let objects = self.list().await?;
+        let collect_tasks = objects
+            .into_iter()
+            .map(|object| async move { self.write_with_retry(&object).await });
+
+        stream::iter(collect_tasks)
+            .buffer_unordered(self.collect_concurrency())
+            .collect::<Vec<_>>()
+            .await;
 
         Ok(())
     }
@@ -288,5 +298,124 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::Api;
+    use kube::ResourceExt;
+    use kube::api::TypeMeta;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+    use tokio::time::sleep;
+
+    use crate::cli::DEFAULT_OCI_BUFFER_SIZE;
+    use crate::gather::config::Secrets;
+    use crate::gather::representation::{ArchivePath, Representation};
+    use crate::gather::writer::{Archive, Encoding, Writer};
+
+    use super::{Collect, CollectError};
+
+    struct ConcurrencyCollector {
+        objects: Vec<Pod>,
+        writer: Arc<Mutex<Writer>>,
+        current_in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        concurrency: usize,
+    }
+
+    #[async_trait]
+    impl Collect<Pod> for ConcurrencyCollector {
+        fn get_secrets(&self) -> Secrets {
+            Default::default()
+        }
+
+        fn get_writer(&self) -> Arc<Mutex<Writer>> {
+            self.writer.clone()
+        }
+
+        fn filter(&self, _object: &Pod) -> Result<bool, CollectError> {
+            Ok(true)
+        }
+
+        async fn representations(&self, object: &Pod) -> Result<Vec<Representation>> {
+            let in_flight = self.current_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+
+            sleep(Duration::from_millis(25)).await;
+
+            self.current_in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(vec![
+                Representation::new()
+                    .with_path(ArchivePath::Custom(
+                        format!("{}.log", object.name_any()).into(),
+                    ))
+                    .with_data("ok"),
+            ])
+        }
+
+        fn get_api(&self) -> Api<Pod> {
+            unreachable!("list is overridden in this test")
+        }
+
+        fn resource(&self) -> impl crate::gather::representation::TypeMetaGetter {
+            TypeMeta::resource::<Pod>()
+        }
+
+        fn collect_concurrency(&self) -> usize {
+            self.concurrency
+        }
+
+        async fn list(&self) -> Result<Vec<Pod>> {
+            Ok(self.objects.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_respects_collect_concurrency() {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let file_path = tmp_dir.path().join("collect-concurrency-test");
+        let writer = Writer::new(
+            &Archive::new(file_path),
+            &Encoding::Path,
+            None,
+            None,
+            DEFAULT_OCI_BUFFER_SIZE,
+        )
+        .await
+        .expect("failed to create writer")
+        .into();
+
+        let collector = ConcurrencyCollector {
+            objects: (0..6)
+                .map(|idx| Pod {
+                    metadata: kube::core::ObjectMeta {
+                        name: Some(format!("pod-{idx}")),
+                        namespace: Some("default".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            writer,
+            current_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            concurrency: 2,
+        };
+
+        collector.collect().await.expect("collection to succeed");
+
+        assert_eq!(collector.max_in_flight.load(Ordering::SeqCst), 2);
     }
 }
