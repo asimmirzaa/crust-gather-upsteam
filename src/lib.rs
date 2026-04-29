@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod cli;
 pub mod filters;
 pub mod gather;

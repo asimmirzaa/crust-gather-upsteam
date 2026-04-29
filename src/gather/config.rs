@@ -32,6 +32,7 @@ use crate::scanners::nodes::Nodes;
 use crate::scanners::user_logs::UserLogs;
 use crate::scanners::versions::Versions;
 
+use super::analysis_schema::AnalysisSchema;
 use super::report::RunReportState;
 use super::representation::{ArchivePath, CustomLog, NamespaceName, Representation};
 use super::writer::Writer;
@@ -479,11 +480,12 @@ impl Config {
     }
 
     async fn write_run_artifacts(&self, success: bool) -> anyhow::Result<()> {
-        let (report_state, report, stats, failures, warnings) = {
+        let (report_state, schema, report, stats, failures, warnings) = {
             let mut report = self.report.lock().await;
             report.finalize(success);
             (
                 report.report().clone(),
+                serde_yaml::to_string(&AnalysisSchema::current(&report.report().identity))?,
                 serde_yaml::to_string(report.report())?,
                 serde_yaml::to_string(report.stats())?,
                 serde_yaml::to_string(report.failures())?,
@@ -492,6 +494,7 @@ impl Config {
         };
 
         let artifacts = [
+            ("analysis-schema.yaml", schema),
             ("run-report.yaml", report),
             ("run-stats.yaml", stats),
             ("run-failures.yaml", failures),
@@ -812,6 +815,7 @@ mod tests {
 
         let result = config.collect().await;
         assert!(result.is_ok());
+        assert!(file_path.join("analysis-schema.yaml").is_file());
         assert!(file_path.join("run-report.yaml").is_file());
         assert!(file_path.join("run-stats.yaml").is_file());
         assert!(file_path.join("run-failures.yaml").is_file());

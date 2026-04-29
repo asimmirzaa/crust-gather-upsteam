@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::Filters;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunIdentity {
     pub collector_name: String,
     pub collector_version: String,
@@ -22,13 +22,13 @@ impl Default for RunIdentity {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputLog {
     pub name: String,
     pub command: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunInputs {
     pub mode: String,
     pub source: String,
@@ -75,7 +75,7 @@ impl Default for RunInputs {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CollectorStats {
     pub listed_objects: usize,
     pub collected_objects: usize,
@@ -84,7 +84,7 @@ pub struct CollectorStats {
     pub warnings: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunMessage {
     pub timestamp: DateTime<Utc>,
     pub phase: String,
@@ -93,7 +93,7 @@ pub struct RunMessage {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunTotals {
     pub collectors: usize,
     pub listed_objects: usize,
@@ -103,7 +103,7 @@ pub struct RunTotals {
     pub warnings: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunReport {
     pub identity: RunIdentity,
     pub inputs: RunInputs,
