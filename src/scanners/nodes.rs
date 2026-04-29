@@ -160,17 +160,26 @@ impl Nodes {
             }
         }
 
-        let mut representations = vec![
+        let mut representations = vec![];
+
+        self.extend_with_node_log(
+            &mut representations,
+            node,
+            "legacy-kubelet-log",
             self.get_representation(
                 pod_name.as_str(),
                 vec!["sh", "-c", "cat /host/var/log/kubelet.log"],
                 ArchivePath::logs_path(node, TypeMeta::resource::<Node>(), LogGroup::KubeletLegacy),
             )
             .await?,
-        ];
+        )
+        .await;
 
         for systemd_unit in self.systemd_units.iter() {
-            representations.push(
+            self.extend_with_node_log(
+                &mut representations,
+                node,
+                &format!("systemd-unit:{systemd_unit}"),
                 self.get_representation(
                     pod_name.as_str(),
                     vec![
@@ -187,13 +196,14 @@ impl Nodes {
                     ),
                 )
                 .await?,
-            );
+            )
+            .await;
         }
 
         api.delete(&pod_name, &DeleteParams::default().grace_period(0))
             .await?;
 
-        Ok(representations.into_iter().flatten().collect())
+        Ok(representations)
     }
 
     #[instrument(skip_all, fields(node = path.to_string()))]
@@ -223,6 +233,26 @@ impl Nodes {
                 Ok(None)
             }
             data => Ok(Some(Representation::new().with_path(path).with_data(data))),
+        }
+    }
+
+    async fn extend_with_node_log(
+        &self,
+        representations: &mut Vec<Representation>,
+        node: &Node,
+        source: &str,
+        representation: Option<Representation>,
+    ) {
+        match representation {
+            Some(representation) => representations.push(representation),
+            None => {
+                self.get_report().lock().await.record_warning(
+                    "node-logs",
+                    self.collector_name(),
+                    Some(node.name_any()),
+                    format!("No output collected from {source}"),
+                );
+            }
         }
     }
 
