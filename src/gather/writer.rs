@@ -17,6 +17,7 @@ use serde::Deserialize;
 use sha2::Digest as _;
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     ffi::OsStr,
     fmt::Display,
     fs::{DirBuilder, File},
@@ -34,7 +35,9 @@ use zip::{ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 use crate::cli::DEFAULT_OCI_BUFFER_SIZE;
 use crate::gather::{
+    agent_artifacts::AgentArtifactsState,
     reader::{ArchiveReader, Reader},
+    report::{CollectorStats, RunMessage, RunReport},
     storage::Storage,
 };
 
@@ -179,15 +182,20 @@ impl From<&str> for Encoding {
     }
 }
 
-/// The Writer enum represents the different archive writer implementations.
+/// The WriterSink enum represents the different archive writer implementations.
 /// Gzip uses the gzip compression format.
 /// Zip uses the zip compression format.
 /// Oci uses the remote image reference as a destination.
-pub enum Writer {
+enum WriterSink {
     Path(Archive),
     Gzip(Archive, Box<Builder<GzEncoder<File>>>),
     Zip(Archive, Box<ZipWriter<File>>),
     Oci(Archive, Client, Box<Reference>, RegistryAuth, usize),
+}
+
+pub struct Writer {
+    sink: WriterSink,
+    agent_artifacts: AgentArtifactsState,
 }
 
 impl From<Writer> for Arc<Mutex<Writer>> {
@@ -199,7 +207,11 @@ impl From<Writer> for Arc<Mutex<Writer>> {
 impl Writer {
     /// Finish zip archive
     pub fn finish_zip(self) -> anyhow::Result<()> {
-        let Self::Zip(_, builder) = self else {
+        let Writer {
+            sink: WriterSink::Zip(_, builder),
+            ..
+        } = self
+        else {
             return anyhow::Result::Ok(());
         };
 
@@ -209,16 +221,24 @@ impl Writer {
 
     /// Finish gzip archive
     pub fn finish_gzip(&mut self) -> anyhow::Result<()> {
-        let Self::Gzip(_, builder) = self else {
+        let WriterSink::Gzip(archive, _) = &self.sink else {
             return anyhow::Result::Ok(());
         };
 
-        Ok(builder.finish()?)
+        let archive = archive.clone();
+        let sink = std::mem::replace(&mut self.sink, WriterSink::Path(archive));
+        let WriterSink::Gzip(_, builder) = sink else {
+            unreachable!("writer sink variant changed during finish_gzip");
+        };
+
+        let encoder = (*builder).into_inner()?;
+        encoder.finish()?;
+        Ok(())
     }
 
     /// Finish writing the archive, finalizing any compression and flushing buffers.
     pub async fn finish_oci(&self) -> anyhow::Result<()> {
-        let Self::Oci(archive, client, image_ref, auth, buffer_size) = self else {
+        let WriterSink::Oci(archive, client, image_ref, auth, buffer_size) = &self.sink else {
             return Ok(());
         };
 
@@ -252,18 +272,18 @@ impl Writer {
                         .ok_or(anyhow::anyhow!("file path is not convertable to string"))?;
                     let mut file =
                         File::open(path).context(format!("failed to open file {archive_path}"))?;
-                    let mut data = String::new();
-                    File::read_to_string(&mut file, &mut data)
+                    let mut data = vec![];
+                    File::read_to_end(&mut file, &mut data)
                         .context(format!("failed to read file {archive_path}"))?;
                     if data.is_empty() {
                         // That could only happen for empty logs, so we publish an empty json instead
                         // as ghcr doesn't allow empty layers
-                        data = "{}".to_string();
+                        data = b"{}".to_vec();
                     };
                     let size = data.len() as i64;
                     let digest = format!(
                         "sha256:{}",
-                        hex::encode(sha2::Sha256::digest(data.as_bytes()))
+                        hex::encode(sha2::Sha256::digest(&data))
                     );
                     {
                         layers.lock().await.push(OciDescriptor {
@@ -332,32 +352,42 @@ impl Writer {
     /// Adds a representation data to the archive under the representation path
     #[instrument(skip_all, fields(repr = repr.path().to_string()))]
     pub async fn store(&mut self, repr: &Representation) -> anyhow::Result<()> {
+        self.store_bytes(repr.path(), repr.data().as_bytes())
+            .await?;
+        self.agent_artifacts.observe(repr)?;
+        Ok(())
+    }
+
+    pub async fn store_bytes(
+        &mut self,
+        path: ArchivePath,
+        data: impl AsRef<[u8]>,
+    ) -> anyhow::Result<()> {
         tracing::debug!("Writing...");
 
-        let archive_path: String = repr.path().try_into()?;
-        let data = repr.data();
+        let archive_path: String = path.clone().try_into()?;
+        let data = data.as_ref();
 
-        match self {
-            Self::Path(Archive(archive)) | Self::Oci(Archive(archive), ..) => {
+        match &mut self.sink {
+            WriterSink::Path(Archive(archive)) | WriterSink::Oci(Archive(archive), ..) => {
                 let file = archive.join(archive_path);
                 DirBuilder::new()
                     .recursive(true)
                     .create(file.parent().unwrap())?;
                 let mut file = File::create(file)?;
-                file.write_all(data.as_bytes())?;
+                file.write_all(data)?;
             }
-            Self::Gzip(Archive(archive), builder) => {
+            WriterSink::Gzip(Archive(archive), builder) => {
                 let mut header = Header::new_gnu();
-                header.set_size(data.len() as u64 + 1);
+                header.set_size(data.len() as u64);
                 header.set_cksum();
                 header.set_mode(0o644);
 
                 let root_prefix = archive.file_stem().unwrap();
                 let file = PathBuf::from(root_prefix).join(archive_path);
-                builder.append_data(&mut header, file, data.as_bytes())?;
+                builder.append_data(&mut header, file, data)?;
             }
-            Self::Zip(Archive(archive), writer) => {
-                let path = repr.path();
+            WriterSink::Zip(Archive(archive), writer) => {
                 let path = path.parent().unwrap().to_str().unwrap();
                 writer
                     .add_directory(path, SimpleFileOptions::default())
@@ -375,9 +405,40 @@ impl Writer {
                         ZipError::InvalidArchive(Cow::Borrowed("Duplicate filename")) => Ok(()),
                         other => Err(other),
                     })?;
-                writer.write_all(data.as_bytes())?;
+                writer.write_all(data)?;
             }
         }
+        Ok(())
+    }
+
+    pub async fn write_agent_artifacts(
+        &mut self,
+        report: &RunReport,
+        stats: &BTreeMap<String, CollectorStats>,
+        failures: &[RunMessage],
+        warnings: &[RunMessage],
+    ) -> anyhow::Result<()> {
+        let artifacts = self
+            .agent_artifacts
+            .finalize(report, stats, failures, warnings)?;
+
+        for (path, data) in [
+            ("AGENT-START.md", artifacts.agent_start.into_bytes()),
+            (
+                "resource-index.jsonl",
+                artifacts.resource_index.into_bytes(),
+            ),
+            (
+                "relation-index.jsonl",
+                artifacts.relation_index.into_bytes(),
+            ),
+            ("log-index.jsonl", artifacts.log_index.into_bytes()),
+            ("snapshot.sqlite", artifacts.sqlite_bytes),
+        ] {
+            self.store_bytes(ArchivePath::Custom(path.into()), data)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -388,8 +449,8 @@ impl Writer {
 
         let archive_path: String = repr.path().try_into()?;
 
-        match self {
-            Self::Path(archive) => {
+        match &mut self.sink {
+            WriterSink::Path(archive) => {
                 let file_path = archive.0.join(archive_path);
 
                 // generate diff and write
@@ -414,13 +475,13 @@ impl Writer {
                 }
                 self.store(repr).await?;
             }
-            Self::Gzip(Archive(_archive), _builder) => {
+            WriterSink::Gzip(Archive(_archive), _builder) => {
                 unimplemented!();
             }
-            Self::Zip(Archive(_archive), _writer) => {
+            WriterSink::Zip(Archive(_archive), _writer) => {
                 unimplemented!();
             }
-            Self::Oci(..) => {
+            WriterSink::Oci(..) => {
                 unimplemented!();
             }
         }
@@ -443,28 +504,31 @@ impl Writer {
             Some(_) | None => (),
         };
 
-        Ok(match encoding {
-            Encoding::Path => Self::Path(archive.clone()),
-            Encoding::Gzip => Self::Gzip(
-                archive.clone(),
-                Box::new(Builder::new(GzEncoder::new(
-                    File::create(archive.0.with_extension("tar.gz"))?,
-                    Compression::default(),
-                ))),
-            ),
-            Encoding::Zip => Self::Zip(
-                archive.clone(),
-                Box::new(ZipWriter::new(File::create(
-                    archive.0.with_extension("zip"),
-                )?)),
-            ),
-            Encoding::Oci(image_ref) => Self::Oci(
-                archive.clone(),
-                Client::new(client_config.unwrap_or_default()),
-                image_ref.clone().into(),
-                auth.unwrap_or(RegistryAuth::Anonymous),
-                buffer_size,
-            ),
+        Ok(Self {
+            sink: match encoding {
+                Encoding::Path => WriterSink::Path(archive.clone()),
+                Encoding::Gzip => WriterSink::Gzip(
+                    archive.clone(),
+                    Box::new(Builder::new(GzEncoder::new(
+                        File::create(archive.0.with_extension("tar.gz"))?,
+                        Compression::default(),
+                    ))),
+                ),
+                Encoding::Zip => WriterSink::Zip(
+                    archive.clone(),
+                    Box::new(ZipWriter::new(File::create(
+                        archive.0.with_extension("zip"),
+                    )?)),
+                ),
+                Encoding::Oci(image_ref) => WriterSink::Oci(
+                    archive.clone(),
+                    Client::new(client_config.unwrap_or_default()),
+                    image_ref.clone().into(),
+                    auth.unwrap_or(RegistryAuth::Anonymous),
+                    buffer_size,
+                ),
+            },
+            agent_artifacts: AgentArtifactsState::default(),
         })
     }
 }
@@ -473,14 +537,23 @@ impl Writer {
 mod tests {
     use std::{
         env,
-        fs::{self},
+        fs::{self, File},
+        io::Read,
     };
 
+    use chrono::Utc;
+    use flate2::read::GzDecoder;
+    use tar::Archive as TarArchive;
     use tempfile::TempDir;
 
     use crate::{
         cli::DEFAULT_OCI_BUFFER_SIZE,
-        gather::{config::Secrets, representation::ArchivePath, writer::Representation},
+        gather::{
+            config::Secrets,
+            report::{RunIdentity, RunInputs, RunReport},
+            representation::ArchivePath,
+            writer::Representation,
+        },
     };
 
     use super::{Archive, Encoding, Writer};
@@ -519,8 +592,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_gzip() {
-        use crate::gather::representation::ArchivePath;
-
         let tmp_dir = TempDir::new().expect("failed to create temp dir");
         let archive = tmp_dir.path().join("test");
         let mut writer = Writer::new(
@@ -540,6 +611,37 @@ mod tests {
         assert!(writer.store(&repr).await.is_ok());
         assert!(writer.finish_gzip().is_ok());
         assert!(archive.with_file_name("test.tar.gz").exists());
+
+        let file = File::open(archive.with_file_name("test.tar.gz")).unwrap();
+        let mut tar_archive = TarArchive::new(GzDecoder::new(file));
+        let entries = tar_archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            entries.iter().any(|path| path.ends_with("test.txt")),
+            "missing test.txt entry in {:?}",
+            entries
+        );
+        let file = File::open(archive.with_file_name("test.tar.gz")).unwrap();
+        let mut tar_archive = TarArchive::new(GzDecoder::new(file));
+        let mut data = String::new();
+        tar_archive
+            .entries()
+            .unwrap()
+            .find_map(|entry| {
+                let mut entry = entry.ok()?;
+                let path = entry.path().ok()?.to_path_buf();
+                if path.to_string_lossy().ends_with("test.txt") {
+                    entry.read_to_string(&mut data).ok()?;
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .expect("test.txt contents");
+        assert_eq!(data, "content");
     }
 
     #[tokio::test]
@@ -606,7 +708,7 @@ mod tests {
 
         let repr = Representation::new()
             .with_data("content with secret")
-            .with_path(ArchivePath::Namespaced("test.txt".into()));
+            .with_path(ArchivePath::Custom("test.txt".into()));
 
         let secret: Secrets = vec!["SECRET".into()].into();
         assert!(writer.store(&secret.strip(&repr)).await.is_ok());
@@ -614,6 +716,115 @@ mod tests {
         assert!(archive.join("test.txt").exists());
         let data = fs::read_to_string(archive.join("test.txt")).unwrap();
         assert_eq!(data, "content with xxx");
+    }
+
+    #[tokio::test]
+    async fn test_store_bytes_zip() {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let archive = tmp_dir.path().join("binary.zip");
+        let mut writer = Writer::new(
+            &Archive::new(archive.clone()),
+            &Encoding::Zip,
+            None,
+            None,
+            DEFAULT_OCI_BUFFER_SIZE,
+        )
+        .await
+        .unwrap();
+
+        writer
+            .store_bytes(
+                ArchivePath::Custom("snapshot.sqlite".into()),
+                [1_u8, 2, 3, 4],
+            )
+            .await
+            .unwrap();
+        writer.finish_zip().unwrap();
+
+        let mut zip = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+        let mut file = zip.by_name("binary/snapshot.sqlite").unwrap();
+        let mut data = vec![];
+        file.read_to_end(&mut data).unwrap();
+        assert_eq!(data, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_write_agent_artifacts_path() {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let archive = tmp_dir.path().join("collected");
+        let mut writer = Writer::new(
+            &Archive::new(archive.clone()),
+            &Encoding::Path,
+            None,
+            None,
+            DEFAULT_OCI_BUFFER_SIZE,
+        )
+        .await
+        .unwrap();
+
+        writer
+            .store(
+                &Representation::new()
+                    .with_path(ArchivePath::Namespaced(
+                        "namespaces/default/v1/pod/web-123.yaml".into(),
+                    ))
+                    .with_data(
+                        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-123
+  namespace: default
+spec:
+  nodeName: worker-1
+  serviceAccountName: web-sa
+  containers:
+    - name: web
+      image: nginx:1.27
+"#,
+                    ),
+            )
+            .await
+            .unwrap();
+        writer
+            .store(
+                &Representation::new()
+                    .with_path(ArchivePath::Logs(
+                        "namespaces/default/v1/pod/web-123/web/current.log".into(),
+                    ))
+                    .with_data("INFO boot\nWARN cache miss\n"),
+            )
+            .await
+            .unwrap();
+
+        let report = RunReport {
+            identity: RunIdentity::default(),
+            inputs: RunInputs::default(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            duration_ms: Some(10),
+            success: true,
+            totals: Default::default(),
+            stats: Default::default(),
+            warnings: vec![],
+            failures: vec![],
+        };
+
+        writer
+            .write_agent_artifacts(&report, &report.stats, &report.failures, &report.warnings)
+            .await
+            .unwrap();
+
+        assert!(archive.join("AGENT-START.md").is_file());
+        assert!(archive.join("resource-index.jsonl").is_file());
+        assert!(archive.join("relation-index.jsonl").is_file());
+        assert!(archive.join("log-index.jsonl").is_file());
+        assert!(archive.join("snapshot.sqlite").is_file());
+        assert!(
+            fs::read(archive.join("snapshot.sqlite"))
+                .unwrap()
+                .starts_with(b"SQLite format 3")
+        );
     }
 
     #[tokio::test]

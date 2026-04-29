@@ -1,3 +1,4 @@
+pub mod agent_artifacts;
 pub mod config;
 pub mod log;
 pub mod printers;
