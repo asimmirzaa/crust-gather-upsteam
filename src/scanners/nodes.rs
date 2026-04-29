@@ -64,6 +64,8 @@ struct CommandOutput {
     status: Option<Status>,
 }
 
+const NODE_LOG_COLLECT_CONCURRENCY: usize = 1;
+
 #[derive(Clone)]
 pub struct Nodes {
     pub collectable: Objects<Node>,
@@ -103,6 +105,10 @@ impl Collect<Node> for Nodes {
 
     fn get_tuning(&self) -> CollectionTuning {
         self.collectable.get_tuning()
+    }
+
+    fn collect_concurrency(&self) -> usize {
+        NODE_LOG_COLLECT_CONCURRENCY
     }
 
     fn filter(&self, obj: &Node) -> Result<bool, CollectError> {
@@ -591,6 +597,11 @@ mod tests {
             .and_then(|container| container.command.clone())
             .expect("debug container command should be present");
         assert_eq!(command, vec!["sh", "-c", "while true; do sleep 3600; done"]);
+    }
+
+    #[test]
+    fn node_log_collection_is_serialized() {
+        assert_eq!(NODE_LOG_COLLECT_CONCURRENCY, 1);
     }
 
     #[test]
