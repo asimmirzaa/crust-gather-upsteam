@@ -1,4 +1,4 @@
-use anyhow;
+use anyhow::{self, Context};
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use chrono::Utc;
@@ -189,14 +189,47 @@ pub trait Collect<R: ResourceThreadSafe>: Send {
     #[instrument(skip_all, err)]
     async fn collect(&self) -> anyhow::Result<()> {
         let objects = self.list().await?;
-        let collect_tasks = objects
-            .into_iter()
-            .map(|object| async move { self.write_with_retry(&object).await });
+        let kind = self.resource().to_type_meta().kind;
+        let collect_tasks = objects.into_iter().map(|object| {
+            let kind = kind.clone();
+            let object_name = object.name_any();
+            let object_ref = object
+                .namespace()
+                .map(|namespace| format!("{namespace}/{object_name}"))
+                .unwrap_or(object_name);
 
-        stream::iter(collect_tasks)
+            async move {
+                self.write_with_retry(&object)
+                    .await
+                    .with_context(|| format!("failed to collect {kind} {object_ref}"))
+            }
+        });
+
+        let mut collect_tasks = stream::iter(collect_tasks)
             .buffer_unordered(self.collect_concurrency())
-            .collect::<Vec<_>>()
-            .await;
+            .boxed();
+        let mut errors = vec![];
+
+        while let Some(result) = collect_tasks.next().await {
+            if let Err(err) = result {
+                errors.push(err);
+            }
+        }
+
+        if !errors.is_empty() {
+            let sample_errors = errors
+                .iter()
+                .take(3)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+
+            return Err(anyhow::anyhow!(
+                "failed to collect {} object(s): {}",
+                errors.len(),
+                sample_errors,
+            ));
+        }
 
         Ok(())
     }
@@ -324,12 +357,32 @@ mod tests {
 
     use super::{Collect, CollectError};
 
+    async fn test_writer(name: &str) -> Arc<Mutex<Writer>> {
+        let tmp_dir = TempDir::new().expect("failed to create temp dir");
+        let file_path = tmp_dir.path().join(name);
+        Writer::new(
+            &Archive::new(file_path),
+            &Encoding::Path,
+            None,
+            None,
+            DEFAULT_OCI_BUFFER_SIZE,
+        )
+        .await
+        .expect("failed to create writer")
+        .into()
+    }
+
     struct ConcurrencyCollector {
         objects: Vec<Pod>,
         writer: Arc<Mutex<Writer>>,
         current_in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         concurrency: usize,
+    }
+
+    struct StoreFailingCollector {
+        objects: Vec<Pod>,
+        writer: Arc<Mutex<Writer>>,
     }
 
     #[async_trait]
@@ -380,21 +433,49 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Collect<Pod> for StoreFailingCollector {
+        fn get_secrets(&self) -> Secrets {
+            Default::default()
+        }
+
+        fn get_writer(&self) -> Arc<Mutex<Writer>> {
+            self.writer.clone()
+        }
+
+        fn filter(&self, _object: &Pod) -> Result<bool, CollectError> {
+            Ok(true)
+        }
+
+        async fn representations(&self, object: &Pod) -> Result<Vec<Representation>> {
+            if object.name_any() == "pod-fail" {
+                return Ok(vec![Representation::new().with_data("will fail to store")]);
+            }
+
+            Ok(vec![
+                Representation::new()
+                    .with_path(ArchivePath::Custom(
+                        format!("{}.log", object.name_any()).into(),
+                    ))
+                    .with_data("ok"),
+            ])
+        }
+
+        fn get_api(&self) -> Api<Pod> {
+            unreachable!("list is overridden in this test")
+        }
+
+        fn resource(&self) -> impl crate::gather::representation::TypeMetaGetter {
+            TypeMeta::resource::<Pod>()
+        }
+
+        async fn list(&self) -> Result<Vec<Pod>> {
+            Ok(self.objects.clone())
+        }
+    }
+
     #[tokio::test]
     async fn collect_respects_collect_concurrency() {
-        let tmp_dir = TempDir::new().expect("failed to create temp dir");
-        let file_path = tmp_dir.path().join("collect-concurrency-test");
-        let writer = Writer::new(
-            &Archive::new(file_path),
-            &Encoding::Path,
-            None,
-            None,
-            DEFAULT_OCI_BUFFER_SIZE,
-        )
-        .await
-        .expect("failed to create writer")
-        .into();
-
         let collector = ConcurrencyCollector {
             objects: (0..6)
                 .map(|idx| Pod {
@@ -406,7 +487,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            writer,
+            writer: test_writer("collect-concurrency-test").await,
             current_in_flight: Arc::new(AtomicUsize::new(0)),
             max_in_flight: Arc::new(AtomicUsize::new(0)),
             concurrency: 2,
@@ -415,5 +496,30 @@ mod tests {
         collector.collect().await.expect("collection to succeed");
 
         assert_eq!(collector.max_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_returns_error_when_any_object_collection_fails() {
+        let collector = StoreFailingCollector {
+            objects: ["pod-ok", "pod-fail"]
+                .into_iter()
+                .map(|name| Pod {
+                    metadata: kube::core::ObjectMeta {
+                        name: Some(name.to_string()),
+                        namespace: Some("default".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            writer: test_writer("collect-error-test").await,
+        };
+
+        let err = collector
+            .collect()
+            .await
+            .expect_err("collection should fail when any object fails");
+
+        assert!(err.to_string().contains("pod-fail"));
     }
 }
