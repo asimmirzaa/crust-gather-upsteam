@@ -178,8 +178,15 @@ pub fn render_markdown(report: &DiffReport) -> String {
     }
 
     out.push_str("## Count Deltas\n\n");
-    for delta in &report.counts_by_kind {
-        if delta.delta != 0 {
+    let count_deltas = report
+        .counts_by_kind
+        .iter()
+        .filter(|delta| delta.delta != 0)
+        .collect::<Vec<_>>();
+    if count_deltas.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for delta in count_deltas {
             out.push_str(&format!(
                 "- `{}`: {} -> {} ({:+})\n",
                 delta.scope, delta.before, delta.after, delta.delta
@@ -189,15 +196,19 @@ pub fn render_markdown(report: &DiffReport) -> String {
     out.push('\n');
 
     out.push_str("## Namespace Deltas\n\n");
-    for delta in &report.namespace_deltas {
-        out.push_str(&format!(
-            "- `{}` resources {} -> {}, logs {} -> {}\n",
-            delta.namespace,
-            delta.resource_before,
-            delta.resource_after,
-            delta.log_before,
-            delta.log_after
-        ));
+    if report.namespace_deltas.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for delta in &report.namespace_deltas {
+            out.push_str(&format!(
+                "- `{}` resources {} -> {}, logs {} -> {}\n",
+                delta.namespace,
+                delta.resource_before,
+                delta.resource_after,
+                delta.log_before,
+                delta.log_after
+            ));
+        }
     }
 
     out
@@ -257,12 +268,21 @@ fn namespace_deltas(before: &Snapshot, after: &Snapshot) -> Vec<NamespaceDelta> 
 
     namespaces
         .into_iter()
-        .map(|namespace| NamespaceDelta {
-            namespace: namespace.clone(),
-            resource_before: *before_resources.get(&namespace).unwrap_or(&0),
-            resource_after: *after_resources.get(&namespace).unwrap_or(&0),
-            log_before: *before_logs.get(&namespace).unwrap_or(&0),
-            log_after: *after_logs.get(&namespace).unwrap_or(&0),
+        .filter_map(|namespace| {
+            let resource_before = *before_resources.get(&namespace).unwrap_or(&0);
+            let resource_after = *after_resources.get(&namespace).unwrap_or(&0);
+            let log_before = *before_logs.get(&namespace).unwrap_or(&0);
+            let log_after = *after_logs.get(&namespace).unwrap_or(&0);
+
+            (resource_before != resource_after || log_before != log_after).then_some(
+                NamespaceDelta {
+                    namespace,
+                    resource_before,
+                    resource_after,
+                    log_before,
+                    log_after,
+                },
+            )
         })
         .collect()
 }
@@ -338,7 +358,7 @@ mod tests {
         gather::{agent_artifacts::ResourceIndexEntry, report::RunMessage},
     };
 
-    use super::{ResourceChangeKind, build};
+    use super::{ResourceChangeKind, build, render_markdown};
 
     #[test]
     fn diff_detects_removed_changed_and_image_drift() {
@@ -359,6 +379,22 @@ mod tests {
         }));
         assert!(report.image_changes.iter().any(|change| change.after == "nginx:1.28.0"));
         assert_eq!(report.warning_delta, 1);
+    }
+
+    #[test]
+    fn self_diff_omits_empty_count_and_namespace_sections() {
+        let snapshot = sample_snapshot("diff-same").expect("snapshot");
+        let snapshot = Snapshot::open(snapshot.root()).expect("snapshot");
+
+        let report = build(&snapshot, &snapshot).expect("report");
+        assert!(report.resource_changes.is_empty());
+        assert!(report.image_changes.is_empty());
+        assert!(report.namespace_deltas.is_empty());
+        assert!(report.counts_by_kind.iter().all(|delta| delta.delta == 0));
+
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("## Count Deltas\n\n- none"));
+        assert!(markdown.contains("## Namespace Deltas\n\n- none"));
     }
 
     fn mutate_after_snapshot(root: &Path) -> anyhow::Result<()> {
