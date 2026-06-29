@@ -2,6 +2,7 @@ use std::{
     fmt::{self, Debug},
     ops::Deref,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -107,11 +108,10 @@ impl From<Config> for HostLogs {
     fn from(value: Config) -> Self {
         let mut logs = value.additional_logs.clone();
         for systemd_unit in value.systemd_units.iter() {
+            let command = format!("journalctl -u {systemd_unit} --no-pager");
             logs.push(CustomLog {
                 path: systemd_unit.to_string(),
-                command: format!(
-                    "chroot /host /bin/sh <<\"EOT\"\njournalctl -u {systemd_unit}\nEOT"
-                ),
+                command: format!("chroot /host /bin/sh -lc {}", shell_quote(&command)),
             });
         }
 
@@ -132,6 +132,18 @@ impl Collect<Node> for HostLogs {
 
     fn get_writer(&self) -> Arc<Mutex<Writer>> {
         self.collectable.get_writer()
+    }
+
+    fn get_report(&self) -> Arc<Mutex<crate::gather::report::RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> crate::gather::config::CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
+    fn collect_concurrency(&self) -> usize {
+        1
     }
 
     fn filter(&self, obj: &Node) -> Result<bool, CollectError> {
@@ -160,9 +172,20 @@ impl Collect<Node> for HostLogs {
         let logs = self.logs.iter().map(|l| l.path.clone()).collect();
         representations.push(Self::pod_representation(&pod, logs)?);
 
+        let collector = self.collector_name();
         for log in self.logs.deref() {
-            let logs = self.collect_logs(&pod, log).await?;
-            representations.extend(logs);
+            match self.collect_logs(&pod, log).await {
+                Ok(logs) => representations.extend(logs),
+                Err(error) => {
+                    self.get_report().lock().await.record_warning(
+                        "host-logs",
+                        collector.clone(),
+                        Some(node_name.clone()),
+                        format!("failed to collect {}: {error}", log.path),
+                    );
+                    tracing::warn!(log = log.path, %error, "Failed to collect host log");
+                }
+            }
         }
 
         Ok(representations)
@@ -315,12 +338,28 @@ impl HostLogs {
             .await
             .map_err(DebugPodError::Get)?;
 
-        if found.is_none() {
-            tracing::info!("Creating user logs debug pod");
-            api.create(&Default::default(), &pod)
-                .await
-                .map_err(DebugPodError::Create)?;
-        };
+        if found.is_some() {
+            tracing::info!("Refreshing stale host logs debug pod");
+            let _ = api
+                .delete(&pod.name_any(), &DeleteParams::default().grace_period(0))
+                .await;
+            for _ in 0..30 {
+                if api
+                    .get_opt(pod.name_any().as_str())
+                    .await
+                    .map_err(DebugPodError::Get)?
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+
+        tracing::info!("Creating host logs debug pod");
+        api.create(&Default::default(), &pod)
+            .await
+            .map_err(DebugPodError::Create)?;
 
         Ok(())
     }
@@ -419,6 +458,10 @@ impl HostLogs {
             .with_path(path)
             .with_data(&serde_saphyr::to_string(&result)?))
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

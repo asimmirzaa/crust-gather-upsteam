@@ -87,17 +87,26 @@ username: ""
 password: ""
 hideSensitive: false
 
+collect:
+  cleanOutput: true
+  nodeLogMode: disabled
+  listPageLimit: 100
+  collectConcurrency: 32
+  logCollectConcurrency: 8
+
 job:
   backoffLimit: 6
   restartPolicy: OnFailure
   ttlSecondsAfterFinished: 300
   command: []
   args: []
+  outputPath: /apps/crust-gather/output
   # Exclude chart-managed resources from collection by built-in Helm labels.
   # This prevents crust-gather from collecting its own Job, ServiceAccount,
   # chart-generated Secrets such as OCI auth or CA material, and Helm release
   # Secrets that may contain rendered credentials in their stored manifests.
   excludeCrustGatherResources: true
+  outputVolumeSizeLimit: 2Gi
   hook:
     enabled: true
     events:
@@ -108,4 +117,4 @@ job:
 
 rbac:
   clusterAdminBinding:
-    enabled: true
+    enabled: false

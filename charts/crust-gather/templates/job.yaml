@@ -80,7 +80,15 @@ spec:
           {{- else if .Values.reference }}
           args:
             - "collect"
+            - "--file={{ .Values.job.outputPath }}"
             - "--reference={{ .Values.reference }}"
+            {{- if .Values.collect.cleanOutput }}
+            - "--clean-output"
+            {{- end }}
+            - "--node-log-mode={{ .Values.collect.nodeLogMode }}"
+            - "--list-page-limit={{ .Values.collect.listPageLimit }}"
+            - "--collect-concurrency={{ .Values.collect.collectConcurrency }}"
+            - "--log-collect-concurrency={{ .Values.collect.logCollectConcurrency }}"
             {{- if .Values.job.excludeCrustGatherResources }}
             - "--exclude-labels={{ include "crust-gather.collectExcludeLabels" . }}"
             - "--exclude-labels={{ include "crust-gather.collectExcludeHelmReleaseSecretLabels" . }}"
@@ -106,7 +114,8 @@ spec:
             {{- end }}
       volumes:
         - name: archive-output
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: {{ .Values.job.outputVolumeSizeLimit | quote }}
         {{- if .Values.ca_file }}
         - name: registry-ca
           secret:

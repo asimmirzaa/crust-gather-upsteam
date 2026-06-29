@@ -18,6 +18,7 @@
 - Store archive in an OCI image.
 - Hide out secret data, by providing environment keys with values to exclude during processing, or a `secrets` file.
 - Browse cluster snapshot with kubectl/k9s, via a local web server.
+- Analyze snapshots offline with `summarize`, `diff`, `audit`, `ai-pack`, and `graph`.
 - Serve OCI snapshot directly as kubernetes-like API server, without downloading the archive locally.
 - Collect cluster snapshot or multiple cluster snapshots in github actions workflow artifact and serve it via `crust-gather serve` ([Demo](#demo-artifact-serving)).
 
@@ -47,6 +48,31 @@ Example:
 helm upgrade --install crust-gather oci://ghcr.io/crust-gather/crust-gather \
   --set reference=ttl.sh/my-cluster-snapshot:1h
 ```
+
+By default the chart now runs in a safer mode:
+
+- `collect.nodeLogMode=disabled` avoids privileged node-debug pods.
+- A generated read-only `ClusterRole` is bound to the ServiceAccount instead of
+  `cluster-admin`.
+- The job workspace is limited with `job.outputVolumeSizeLimit=2Gi`.
+- The job writes into `job.outputPath=/apps/crust-gather/output`, so
+  `--clean-output` can safely remove stale contents without targeting the
+  mounted volume root.
+
+If you need host-level kubelet or custom node log collection, opt in explicitly:
+
+```bash
+helm upgrade --install crust-gather oci://ghcr.io/crust-gather/crust-gather \
+  --set reference=ttl.sh/my-cluster-snapshot:1h \
+  --set collect.nodeLogMode=deep
+```
+
+Each collected snapshot now also contains:
+
+- `run-report.yaml`
+- `run-stats.yaml`
+- `run-failures.yaml`
+- `run-warnings.yaml`
 
 After helm install completes, the OCI archve can be served directly from a docker container:
 
@@ -115,6 +141,47 @@ Or used with `nix`:
 nix shell github:crust-gather/crust-gather
 
 kubectl-crust-gather --help
+```
+
+## Offline Analysis
+
+Collected snapshots now include machine-readable analysis artifacts:
+
+- `analysis-schema.yaml`
+- `run-report.yaml`
+- `run-stats.yaml`
+- `run-failures.yaml`
+- `run-warnings.yaml`
+- `AGENT-START.md`
+- `resource-index.jsonl`
+- `relation-index.jsonl`
+- `log-index.jsonl`
+- `snapshot.sqlite`
+
+These support five offline commands:
+
+```bash
+crust-gather summarize --snapshot ./snapshot
+crust-gather audit --snapshot ./snapshot
+crust-gather graph --snapshot ./snapshot --format mermaid
+crust-gather ai-pack --snapshot ./snapshot --output ./ai-pack
+crust-gather diff --before ./snapshot-a --after ./snapshot-b
+```
+
+Recommended read order for humans or agents:
+
+1. `AGENT-START.md`
+2. `run-report.yaml`
+3. `run-failures.yaml` and `run-warnings.yaml`
+4. `resource-index.jsonl`
+5. `relation-index.jsonl`
+6. `log-index.jsonl`
+7. `snapshot.sqlite`
+
+`graph` is most useful with a namespace filter on large clusters:
+
+```bash
+crust-gather graph --snapshot ./snapshot --namespace kube-system --format mermaid
 ```
 
 ## MCP

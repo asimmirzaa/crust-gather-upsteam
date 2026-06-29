@@ -1,7 +1,8 @@
 use crate::{
     filters::filter::Filter,
     gather::{
-        config::{Config, Secrets},
+        config::{CollectionTuning, Config, Secrets},
+        report::RunReportState,
         representation::TypeMetaGetter,
         writer::Writer,
     },
@@ -24,6 +25,8 @@ pub struct Objects<R: Resource> {
     pub resource: ApiResource,
     secrets: Secrets,
     writer: Arc<Mutex<Writer>>,
+    report: Arc<Mutex<RunReportState>>,
+    tuning: CollectionTuning,
 }
 
 impl<R: ResourceThreadSafe> Debug for Objects<R> {
@@ -44,6 +47,8 @@ where
             filter: config.filter,
             writer: config.writer,
             secrets: config.secrets,
+            report: config.report,
+            tuning: config.tuning,
             resource,
         }
     }
@@ -60,6 +65,8 @@ where
             filter: config.filter,
             writer: config.writer,
             secrets: config.secrets,
+            report: config.report,
+            tuning: config.tuning,
             resource: ApiResource::erase::<R>(&Default::default()),
         }
     }
@@ -74,6 +81,14 @@ impl<R: ResourceThreadSafe> Collect<R> for Objects<R> {
 
     fn get_writer(&self) -> Arc<Mutex<Writer>> {
         self.writer.clone()
+    }
+
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.report.clone()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.tuning
     }
 
     #[instrument(skip_all, fields(kind = self.resource().to_type_meta().kind, apiVersion = self.resource().to_type_meta().api_version), err)]
@@ -108,8 +123,11 @@ mod test {
         api::core::v1::{self, Pod},
         serde_json,
     };
-    use kube::Api;
-    use kube::core::{ApiResource, DynamicObject, params::PostParams};
+    use kube::core::{
+        ApiResource, DynamicObject,
+        params::{ListParams, PostParams},
+    };
+    use kube::{Api, ResourceExt};
 
     use crate::{
         cli::DEFAULT_OCI_BUFFER_SIZE,
@@ -118,15 +136,63 @@ mod test {
             namespace::Namespace,
         },
         gather::{
-            config::{Config, GatherMode},
+            config::{CollectionTuning, Config, GatherMode, Secrets},
+            report::RunReportState,
             representation::ArchivePath,
             writer::{Archive, Encoding, Writer},
         },
-        scanners::{interface::Collect, objects::Objects},
+        scanners::{
+            interface::{Collect, CollectError},
+            objects::Objects,
+        },
     };
+    use tokio::sync::Mutex;
     use tokio::time::timeout;
 
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+
+    #[derive(Clone, Debug)]
+    struct PaginatedNamespaces {
+        collectable: Objects<v1::Namespace>,
+    }
+
+    #[async_trait]
+    impl Collect<v1::Namespace> for PaginatedNamespaces {
+        fn get_secrets(&self) -> Secrets {
+            self.collectable.get_secrets()
+        }
+
+        fn get_writer(&self) -> Arc<Mutex<Writer>> {
+            self.collectable.get_writer()
+        }
+
+        fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+            self.collectable.get_report()
+        }
+
+        fn get_tuning(&self) -> CollectionTuning {
+            self.collectable.get_tuning()
+        }
+
+        fn filter(&self, obj: &v1::Namespace) -> Result<bool, CollectError> {
+            self.collectable.filter(obj)
+        }
+
+        fn get_api(&self) -> Api<v1::Namespace> {
+            self.collectable.get_api()
+        }
+
+        fn list_params(&self) -> ListParams {
+            ListParams::default().limit(1)
+        }
+
+        #[allow(refining_impl_trait)]
+        fn resource(&self) -> ApiResource {
+            self.collectable.resource()
+        }
+    }
 
     #[tokio::test]
     async fn collect_pod() {
@@ -194,6 +260,11 @@ mod test {
                 disable_additional_logs: false,
                 skip_logs_collection: false,
                 skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
             },
             ApiResource::erase::<Pod>(&()),
         )
@@ -240,6 +311,11 @@ mod test {
                 disable_additional_logs: false,
                 skip_logs_collection: false,
                 skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
             },
             ApiResource::erase::<v1::Namespace>(&()),
         );
@@ -248,6 +324,91 @@ mod test {
         let actual = collectable.path(&obj);
 
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn list_fetches_all_server_pages() {
+        let test_env = envtest::Environment::default()
+            .create()
+            .await
+            .expect("cluster");
+        let client = test_env.client().expect("client");
+
+        let namespace_api: Api<v1::Namespace> = Api::all(client.clone());
+        let created_names = [
+            "pagination-test-a",
+            "pagination-test-b",
+            "pagination-test-c",
+        ];
+
+        for name in created_names {
+            timeout(
+                Duration::new(10, 0),
+                (|| async {
+                    namespace_api
+                        .create(
+                            &PostParams::default(),
+                            &serde_json::from_value(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": { "name": name }
+                            }))
+                            .expect("Serialize"),
+                        )
+                        .await
+                })
+                .retry(ConstantBuilder::default().with_delay(Duration::from_secs(1))),
+            )
+            .await
+            .expect("Timeout")
+            .unwrap();
+        }
+
+        let collectable = PaginatedNamespaces {
+            collectable: Objects::new_typed(Config {
+                client,
+                filter: Arc::new(FilterGroup(vec![FilterList(vec![])])),
+                writer: Writer::new(
+                    &Archive::new("crust-gather".into()),
+                    &Encoding::Path,
+                    None,
+                    None,
+                    DEFAULT_OCI_BUFFER_SIZE,
+                )
+                .await
+                .expect("failed to create builder")
+                .into(),
+                secrets: Default::default(),
+                mode: GatherMode::Collect,
+                additional_logs: Default::default(),
+                duration: "1m".try_into().unwrap(),
+                systemd_units: Default::default(),
+                debug_pod: Default::default(),
+                disable_additional_logs: false,
+                skip_logs_collection: false,
+                skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
+            }),
+        };
+
+        let listed_names = collectable
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|namespace| namespace.name_any())
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            created_names
+                .iter()
+                .all(|name| listed_names.contains(*name)),
+            "expected paginated list to include all created namespaces, got {listed_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -283,6 +444,11 @@ mod test {
                 disable_additional_logs: false,
                 skip_logs_collection: false,
                 skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
             },
             ApiResource::erase::<Pod>(&()),
         );

@@ -15,7 +15,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{ArchivePath, Container, LogGroup, Representation},
     writer::Writer,
 };
@@ -23,6 +24,7 @@ use crate::gather::{
 use super::{
     interface::{Collect, CollectError},
     objects::Objects,
+    pod_support::pod_container_refs,
 };
 
 /// Failure to collect logs
@@ -80,6 +82,14 @@ impl Logs {
     }
 }
 
+fn normalize_logs_result(result: Result<String, kube::Error>) -> Result<Option<String>, LogsError> {
+    match result {
+        Ok(logs) => Ok(Some(logs)),
+        Err(kube::Error::Api(status)) if matches!(status.code, 400 | 404) => Ok(None),
+        Err(err) => Err(LogsError(err)),
+    }
+}
+
 #[async_trait]
 impl Collect<Pod> for Logs {
     fn get_secrets(&self) -> Secrets {
@@ -90,11 +100,30 @@ impl Collect<Pod> for Logs {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
+    fn collect_concurrency(&self) -> usize {
+        self.get_tuning().log_collect_concurrency.max(1)
+    }
+
     fn filter(&self, obj: &Pod) -> Result<bool, CollectError> {
         if self.skip_logs_collection {
             return Ok(false);
         }
         self.collectable.filter(obj)
+    }
+
+    fn collector_name(&self) -> String {
+        match self.group {
+            LogSelection::Current => "v1/Pod/current-logs".to_string(),
+            LogSelection::Previous => "v1/Pod/previous-logs".to_string(),
+        }
     }
 
     /// Collects container logs representations.
@@ -103,32 +132,67 @@ impl Collect<Pod> for Logs {
         tracing::debug!("Collecting logs");
 
         let mut representations = vec![];
+        let collector = self.collector_name();
+        let pod_ref = pod
+            .namespace()
+            .map(|namespace| format!("{namespace}/{}", pod.name_any()))
+            .unwrap_or_else(|| pod.name_any());
 
-        for container in pod.spec.clone().unwrap().containers {
-            let logs = match Api::<Pod>::namespaced(
-                self.get_api().into(),
-                pod.namespace().unwrap_or_default().as_ref(),
-            )
-            .logs(
-                pod.name_any().as_str(),
-                &LogParams {
-                    container: Some(container.name.clone()),
-                    since_time: Some(Default::default()),
-                    timestamps: true,
-                    ..self.group.clone().into()
-                },
-            )
-            .await
-            {
-                Ok(logs) => Ok(logs),
-                // If a 400 error occurs, returns the current representations, as that indicates no logs exist.
-                Err(kube::Error::Api(status)) if status.code == 400 => {
-                    tracing::info!("No logs found");
-                    return Ok(representations);
+        for container in pod_container_refs(pod) {
+            let result = normalize_logs_result(
+                Api::<Pod>::namespaced(
+                    self.get_api().into(),
+                    pod.namespace().unwrap_or_default().as_ref(),
+                )
+                .logs(
+                    pod.name_any().as_str(),
+                    &LogParams {
+                        container: Some(container.name.clone()),
+                        since_time: Some(Default::default()),
+                        timestamps: true,
+                        ..self.group.clone().into()
+                    },
+                )
+                .await,
+            );
+
+            let logs = match result {
+                Ok(Some(logs)) => logs,
+                Ok(None) => {
+                    if matches!(self.group, LogSelection::Current) {
+                        self.get_report().lock().await.record_warning(
+                            "logs",
+                            collector.clone(),
+                            Some(format!("{pod_ref}:{}", container.name)),
+                            format!("No {} logs found for {}", self.group, container.kind),
+                        );
+                    }
+                    tracing::debug!(
+                        container = container.name.as_str(),
+                        container_kind = %container.kind,
+                        "No logs found"
+                    );
+                    continue;
                 }
-                e => e,
-            }
-            .map_err(LogsError)?;
+                Err(error) => {
+                    self.get_report().lock().await.record_warning(
+                        "logs",
+                        collector.clone(),
+                        Some(format!("{pod_ref}:{}", container.name)),
+                        format!(
+                            "Failed to collect {} logs for {} container: {}",
+                            self.group, container.kind, error
+                        ),
+                    );
+                    tracing::warn!(
+                        container = container.name.as_str(),
+                        container_kind = %container.kind,
+                        error = %error,
+                        "Failed to collect logs"
+                    );
+                    continue;
+                }
+            };
 
             representations.push(
                 Representation::new()
@@ -136,8 +200,12 @@ impl Collect<Pod> for Logs {
                         pod,
                         TypeMeta::resource::<Pod>(),
                         match self.group {
-                            LogSelection::Current => LogGroup::Current(Container(container.name)),
-                            LogSelection::Previous => LogGroup::Previous(Container(container.name)),
+                            LogSelection::Current => {
+                                LogGroup::Current(Container(container.name.clone()))
+                            }
+                            LogSelection::Previous => {
+                                LogGroup::Previous(Container(container.name.clone()))
+                            }
                         },
                     ))
                     .with_data(logs.as_str()),
@@ -163,9 +231,11 @@ mod test {
     use std::time::Duration;
 
     use backon::{ConstantBuilder, Retryable};
-    use k8s_openapi::{api::core::v1::Pod, serde_json};
+    use k8s_openapi::{
+        api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ListMeta, serde_json,
+    };
     use kube::Api;
-    use kube::core::params::PostParams;
+    use kube::core::{Status, params::PostParams};
     use tempfile::TempDir;
     use tokio::time::timeout;
 
@@ -184,7 +254,54 @@ mod test {
         scanners::{interface::Collect, logs::LogSelection, objects::Objects},
     };
 
-    use super::Logs;
+    use super::{Logs, LogsError, normalize_logs_result};
+
+    #[test]
+    fn normalize_logs_result_treats_400_as_missing_logs() {
+        let status = Status {
+            code: 400,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+                .expect("missing logs to be ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_logs_result_preserves_other_api_errors() {
+        let status = Status {
+            code: 500,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        let err = normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+            .expect_err("500 should bubble");
+        let LogsError(kube::Error::Api(status)) = err else {
+            panic!("unexpected error variant");
+        };
+
+        assert_eq!(status.code, 500);
+    }
+
+    #[test]
+    fn normalize_logs_result_treats_404_as_missing_logs() {
+        let status = Status {
+            code: 404,
+            metadata: Some(ListMeta::default()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_logs_result(Err(kube::Error::Api(Box::new(status))))
+                .expect("deleted pods to be ignored"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn collect_logs() {
@@ -230,8 +347,6 @@ mod test {
         let repr = Logs {
             skip_logs_collection: false,
             collectable: Objects::new_typed(Config {
-                skip_logs_collection: false,
-                skip_events_collection: false,
                 client: test_env.client().expect("client"),
                 filter: Arc::new(FilterGroup(vec![FilterList(vec![vec![filter].into()])])),
                 writer: Writer::new(
@@ -251,6 +366,13 @@ mod test {
                 systemd_units: Default::default(),
                 debug_pod: Default::default(),
                 disable_additional_logs: false,
+                skip_logs_collection: false,
+                skip_events_collection: false,
+                node_log_mode: crate::cli::NodeLogMode::Deep,
+                tuning: Default::default(),
+                report: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::gather::report::RunReportState::default(),
+                )),
             }),
             group: LogSelection::Current,
         }

@@ -5,4 +5,5 @@ pub mod info;
 pub mod interface;
 pub mod logs;
 pub mod objects;
+pub mod pod_support;
 pub mod versions;

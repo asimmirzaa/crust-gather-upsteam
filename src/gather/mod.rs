@@ -1,7 +1,10 @@
+pub mod agent_artifacts;
+pub mod analysis_schema;
 pub mod config;
 pub mod log;
 pub mod printers;
 pub mod reader;
+pub mod report;
 pub mod representation;
 pub mod selector;
 pub mod server;

@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::gather::{
-    config::{Config, Secrets},
+    config::{CollectionTuning, Config, Secrets},
+    report::RunReportState,
     representation::{ArchivePath, Representation},
     writer::Writer,
 };
@@ -43,53 +44,89 @@ impl Collect<Node> for Info {
         self.collectable.get_writer()
     }
 
+    fn get_report(&self) -> Arc<Mutex<RunReportState>> {
+        self.collectable.get_report()
+    }
+
+    fn get_tuning(&self) -> CollectionTuning {
+        self.collectable.get_tuning()
+    }
+
     fn filter(&self, _: &Node) -> Result<bool, CollectError> {
         Ok(true)
     }
 
+    fn collector_name(&self) -> String {
+        "cluster-info".to_string()
+    }
+
     #[instrument(skip_all, err)]
     async fn collect(&self) -> anyhow::Result<()> {
-        let c = self.get_api().into_client();
+        let collector = self.collector_name();
+        let result = async {
+            let c = self.get_api().into_client();
 
-        let version = serde_saphyr::to_string(&c.apiserver_version().await?)?;
-        let api_versions = c
-            .request_text(
-                Request::builder()
-                    .uri("/api")
-                    .header("Accept", v2::ACCEPT_AGGREGATED_DISCOVERY_V2)
-                    .body(vec![])?,
-            )
-            .await?;
-        let apis_versions = c
-            .request_text(
-                Request::builder()
-                    .uri("/apis")
-                    .header("Accept", v2::ACCEPT_AGGREGATED_DISCOVERY_V2)
-                    .body(vec![])?,
-            )
-            .await?;
+            let version = serde_saphyr::to_string(&c.apiserver_version().await?)?;
+            let api_versions = c
+                .request_text(
+                    Request::builder()
+                        .uri("/api")
+                        .header("Accept", v2::ACCEPT_AGGREGATED_DISCOVERY_V2)
+                        .body(vec![])?,
+                )
+                .await?;
+            let apis_versions = c
+                .request_text(
+                    Request::builder()
+                        .uri("/apis")
+                        .header("Accept", v2::ACCEPT_AGGREGATED_DISCOVERY_V2)
+                        .body(vec![])?,
+                )
+                .await?;
 
-        let stamp = Utc::now().to_string();
-        let reprs = vec![
-            Representation::new()
-                .with_path(ArchivePath::Custom("version.yaml".into()))
-                .with_data(version.as_str()),
-            Representation::new()
-                .with_path(ArchivePath::Custom("api.json".into()))
-                .with_data(api_versions.as_str()),
-            Representation::new()
-                .with_path(ArchivePath::Custom("apis.json".into()))
-                .with_data(apis_versions.as_str()),
-            Representation::new()
-                .with_path(ArchivePath::Custom("collected.timestamp".into()))
-                .with_data(&format!("\"{stamp}\"")),
-        ];
+            let stamp = Utc::now().to_string();
+            let reprs = vec![
+                Representation::new()
+                    .with_path(ArchivePath::Custom("version.yaml".into()))
+                    .with_data(version.as_str()),
+                Representation::new()
+                    .with_path(ArchivePath::Custom("api.json".into()))
+                    .with_data(api_versions.as_str()),
+                Representation::new()
+                    .with_path(ArchivePath::Custom("apis.json".into()))
+                    .with_data(apis_versions.as_str()),
+                Representation::new()
+                    .with_path(ArchivePath::Custom("collected.timestamp".into()))
+                    .with_data(&format!("\"{stamp}\"")),
+            ];
 
-        for repr in reprs {
-            self.get_writer().lock().await.store(&repr).await?;
+            let written_files = reprs.len();
+            for repr in reprs {
+                self.get_writer().lock().await.store(&repr).await?;
+            }
+
+            Ok::<usize, anyhow::Error>(written_files)
         }
+        .await;
 
-        Ok(())
+        match result {
+            Ok(written_files) => {
+                self.get_report()
+                    .lock()
+                    .await
+                    .record_success(&collector, 1, written_files);
+                Ok(())
+            }
+            Err(error) => {
+                self.get_report().lock().await.record_failure(
+                    "collect",
+                    collector,
+                    None,
+                    error.to_string(),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn get_api(&self) -> Api<Node> {
