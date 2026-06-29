@@ -384,6 +384,9 @@ mod test {
                 duration: "1m".try_into().unwrap(),
                 systemd_units: Default::default(),
                 debug_pod: Default::default(),
+                disable_additional_logs: false,
+                skip_logs_collection: false,
+                skip_events_collection: false,
                 node_log_mode: crate::cli::NodeLogMode::Deep,
                 tuning: Default::default(),
                 report: std::sync::Arc::new(tokio::sync::Mutex::new(

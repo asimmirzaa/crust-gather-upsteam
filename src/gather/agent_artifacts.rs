@@ -1059,8 +1059,16 @@ metadata:
             .finalize(&report, &BTreeMap::new(), &[], &[])
             .expect("finalize");
 
-        assert!(artifacts.resource_index.contains("cert-manager-controller-approve-cert-manager-io.yaml"));
-        assert!(!artifacts.resource_index.contains("cert-manager-controller-approve:cert-manager-io.yaml"));
+        assert!(
+            artifacts
+                .resource_index
+                .contains("cert-manager-controller-approve-cert-manager-io.yaml")
+        );
+        assert!(
+            !artifacts
+                .resource_index
+                .contains("cert-manager-controller-approve:cert-manager-io.yaml")
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@ impl Collect<Pod> for Logs {
             .unwrap_or_else(|| pod.name_any());
 
         for container in pod_container_refs(pod) {
-            let Some(logs) = normalize_logs_result(
+            let result = normalize_logs_result(
                 Api::<Pod>::namespaced(
                     self.get_api().into(),
                     pod.namespace().unwrap_or_default().as_ref(),
@@ -154,22 +154,44 @@ impl Collect<Pod> for Logs {
                     },
                 )
                 .await,
-            )?
-            else {
-                if matches!(self.group, LogSelection::Current) {
+            );
+
+            let logs = match result {
+                Ok(Some(logs)) => logs,
+                Ok(None) => {
+                    if matches!(self.group, LogSelection::Current) {
+                        self.get_report().lock().await.record_warning(
+                            "logs",
+                            collector.clone(),
+                            Some(format!("{pod_ref}:{}", container.name)),
+                            format!("No {} logs found for {}", self.group, container.kind),
+                        );
+                    }
+                    tracing::debug!(
+                        container = container.name.as_str(),
+                        container_kind = %container.kind,
+                        "No logs found"
+                    );
+                    continue;
+                }
+                Err(error) => {
                     self.get_report().lock().await.record_warning(
                         "logs",
                         collector.clone(),
                         Some(format!("{pod_ref}:{}", container.name)),
-                        format!("No {} logs found for {}", self.group, container.kind),
+                        format!(
+                            "Failed to collect {} logs for {} container: {}",
+                            self.group, container.kind, error
+                        ),
                     );
+                    tracing::warn!(
+                        container = container.name.as_str(),
+                        container_kind = %container.kind,
+                        error = %error,
+                        "Failed to collect logs"
+                    );
+                    continue;
                 }
-                tracing::debug!(
-                    container = container.name.as_str(),
-                    container_kind = %container.kind,
-                    "No logs found"
-                );
-                continue;
             };
 
             representations.push(
@@ -325,8 +347,6 @@ mod test {
         let repr = Logs {
             skip_logs_collection: false,
             collectable: Objects::new_typed(Config {
-                skip_logs_collection: false,
-                skip_events_collection: false,
                 client: test_env.client().expect("client"),
                 filter: Arc::new(FilterGroup(vec![FilterList(vec![vec![filter].into()])])),
                 writer: Writer::new(

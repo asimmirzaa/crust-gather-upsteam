@@ -485,9 +485,7 @@ pub fn workload_risks(snapshot: &Snapshot) -> anyhow::Result<Vec<WorkloadRisk>> 
             if allow_escalation {
                 risks.push(WorkloadRisk {
                     object: object_ref(resource),
-                    issue: format!(
-                        "{container_type} {container_name} allows privilege escalation"
-                    ),
+                    issue: format!("{container_type} {container_name} allows privilege escalation"),
                 });
             }
             if run_as_root {
@@ -513,7 +511,8 @@ pub fn object_ref(resource: &crate::gather::agent_artifacts::ResourceIndexEntry)
 }
 
 fn first_waiting_reason(value: &Value) -> Option<String> {
-    value.pointer("/status/containerStatuses")
+    value
+        .pointer("/status/containerStatuses")
         .and_then(Value::as_array)
         .and_then(|statuses| {
             statuses.iter().find_map(|status| {
@@ -548,7 +547,11 @@ fn collect_route_backend_refs(value: &Value, services: &mut Vec<String>) {
             backends
                 .iter()
                 .filter(|backend| {
-                    backend.get("kind").and_then(Value::as_str).unwrap_or("Service") == "Service"
+                    backend
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Service")
+                        == "Service"
                 })
                 .filter_map(|backend| backend.get("name").and_then(Value::as_str))
                 .map(ToString::to_string),
@@ -561,10 +564,7 @@ fn collect_route_backend_refs(value: &Value, services: &mut Vec<String>) {
     }
 }
 
-fn labels_match(
-    selectors: &BTreeMap<String, String>,
-    labels: &BTreeMap<String, String>,
-) -> bool {
+fn labels_match(selectors: &BTreeMap<String, String>, labels: &BTreeMap<String, String>) -> bool {
     !selectors.is_empty()
         && selectors
             .iter()
@@ -580,9 +580,9 @@ fn pod_ready(
         .pointer("/status/conditions")
         .and_then(Value::as_array)
         .and_then(|conditions| {
-            conditions.iter().find(|condition| {
-                condition.get("type").and_then(Value::as_str) == Some("Ready")
-            })
+            conditions
+                .iter()
+                .find(|condition| condition.get("type").and_then(Value::as_str) == Some("Ready"))
         })
         .and_then(|condition| condition.get("status").and_then(Value::as_str))
         == Some("True"))
@@ -628,7 +628,10 @@ fn normalize_value(mut value: Value) -> Value {
         metadata.remove("managedFields");
         metadata.remove("uid");
         metadata.remove("generation");
-        if let Some(annotations) = metadata.get_mut("annotations").and_then(Value::as_object_mut) {
+        if let Some(annotations) = metadata
+            .get_mut("annotations")
+            .and_then(Value::as_object_mut)
+        {
             annotations.remove("crust-gather.io/added");
             annotations.remove("crust-gather.io/updated");
             annotations.remove("crust-gather.io/deleted");
@@ -644,7 +647,10 @@ fn normalize_value(mut value: Value) -> Value {
 mod tests {
     use crate::analysis::{snapshot::Snapshot, test_support::sample_snapshot};
 
-    use super::{exposure_surfaces, ingress_targets, missing_resource_gaps, node_health, pod_health, service_targets, workload_risks, yaml_digest};
+    use super::{
+        exposure_surfaces, ingress_targets, missing_resource_gaps, node_health, pod_health,
+        service_targets, workload_risks, yaml_digest,
+    };
 
     #[test]
     fn pod_and_node_queries_extract_health_signals() {
@@ -656,7 +662,13 @@ mod tests {
 
         assert_eq!(pods.first().expect("pod").object.name, "web-abc");
         assert_eq!(pods.first().expect("pod").restart_count, 7);
-        assert!(!nodes.iter().find(|node| node.object.name == "control-plane").expect("node").ready);
+        assert!(
+            !nodes
+                .iter()
+                .find(|node| node.object.name == "control-plane")
+                .expect("node")
+                .ready
+        );
     }
 
     #[test]
@@ -667,9 +679,27 @@ mod tests {
         let services = service_targets(&snapshot).expect("services");
         let ingresses = ingress_targets(&snapshot).expect("ingresses");
 
-        assert_eq!(services.iter().find(|service| service.object.name == "web").expect("web").matched_pods.len(), 1);
-        assert!(services.iter().find(|service| service.object.name == "orphan").expect("orphan").matched_pods.is_empty());
-        assert_eq!(ingresses.first().expect("ingress").service_names, vec!["web".to_string()]);
+        assert_eq!(
+            services
+                .iter()
+                .find(|service| service.object.name == "web")
+                .expect("web")
+                .matched_pods
+                .len(),
+            1
+        );
+        assert!(
+            services
+                .iter()
+                .find(|service| service.object.name == "orphan")
+                .expect("orphan")
+                .matched_pods
+                .is_empty()
+        );
+        assert_eq!(
+            ingresses.first().expect("ingress").service_names,
+            vec!["web".to_string()]
+        );
     }
 
     #[test]
@@ -681,7 +711,11 @@ mod tests {
         let gaps = missing_resource_gaps(&snapshot).expect("gaps");
         let risks = workload_risks(&snapshot).expect("risks");
 
-        assert!(exposures.iter().any(|surface| surface.name == "web" && surface.exposure_type == "LoadBalancer"));
+        assert!(
+            exposures
+                .iter()
+                .any(|surface| surface.name == "web" && surface.exposure_type == "LoadBalancer")
+        );
         assert!(gaps.iter().any(|gap| gap.object.name == "debug-tool"));
         assert!(risks.iter().any(|risk| risk.object.name == "debug-tool"));
     }
@@ -690,7 +724,8 @@ mod tests {
     fn yaml_digest_ignores_volatile_metadata() {
         let fixture = sample_snapshot("queries-digest").expect("fixture");
         let snapshot = Snapshot::open(fixture.root()).expect("snapshot");
-        let digest = yaml_digest(&snapshot, "namespaces/default/v1/pod/web-abc.yaml").expect("digest");
+        let digest =
+            yaml_digest(&snapshot, "namespaces/default/v1/pod/web-abc.yaml").expect("digest");
 
         assert!(!digest.contains("resourceVersion"));
         assert!(!digest.contains("managedFields"));

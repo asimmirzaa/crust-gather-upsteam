@@ -453,16 +453,14 @@ impl Writer {
                         archive.0.with_extension("zip"),
                     )?)),
                 ),
-                Encoding::Oci(image_ref) => WriterSink::Oci(
-                    OCIState {
-                        archive: archive.clone(),
-                        config: ManifestConfig { compressed: true },
-                        client: Client::new(client_config.unwrap_or_default()),
-                        image_ref: image_ref.clone().into(),
-                        auth: auth.unwrap_or(RegistryAuth::Anonymous),
-                        buffer_size,
-                    },
-                ),
+                Encoding::Oci(image_ref) => WriterSink::Oci(OCIState {
+                    archive: archive.clone(),
+                    config: ManifestConfig { compressed: true },
+                    client: Client::new(client_config.unwrap_or_default()),
+                    image_ref: image_ref.clone().into(),
+                    auth: auth.unwrap_or(RegistryAuth::Anonymous),
+                    buffer_size,
+                }),
             },
             agent_artifacts: AgentArtifactsState::default(),
         })

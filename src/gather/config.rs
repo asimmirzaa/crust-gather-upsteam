@@ -496,11 +496,11 @@ impl Config {
             report.finalize(success);
             (
                 report.report().clone(),
-                serde_saphyr::to_string(&AnalysisSchema::current(&report.report().identity))?,
-                serde_saphyr::to_string(report.report())?,
-                serde_saphyr::to_string(report.stats())?,
-                serde_saphyr::to_string(report.failures())?,
-                serde_saphyr::to_string(report.warnings())?,
+                serde_yaml::to_string(&AnalysisSchema::current(&report.report().identity))?,
+                serde_yaml::to_string(report.report())?,
+                serde_yaml::to_string(report.stats())?,
+                serde_yaml::to_string(report.failures())?,
+                serde_yaml::to_string(report.warnings())?,
             )
         };
 
@@ -570,12 +570,12 @@ impl Collectable {
     async fn collect(&self) -> anyhow::Result<()> {
         match self {
             Self::WatchDynamic(o) => o.watch_retry(),
-            Self::Dynamic(o) => o.collect_retry(),
-            Self::Pods(l) => l.collect_retry(),
-            Self::Events(e) => e.collect_retry(),
-            Self::HostLogs(u) => u.collect_retry(),
-            Self::Info(i) => i.collect_retry(),
-            Self::Versions(v) => v.collect_retry(),
+            Self::Dynamic(o) => o.collect(),
+            Self::Pods(l) => l.collect(),
+            Self::Events(e) => e.collect(),
+            Self::HostLogs(u) => u.collect(),
+            Self::Info(i) => i.collect(),
+            Self::Versions(v) => v.collect(),
         }
         .await
     }

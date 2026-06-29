@@ -9,8 +9,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::gather::{
-    analysis_schema::AnalysisSchema,
     agent_artifacts::{LogIndexEntry, RelationIndexEntry, ResourceIndexEntry},
+    analysis_schema::AnalysisSchema,
     report::{CollectorStats, RunMessage, RunReport},
 };
 
@@ -58,8 +58,8 @@ impl Snapshot {
         let resources: Vec<ResourceIndexEntry> = read_jsonl(root.join("resource-index.jsonl"))?;
         let relations: Vec<RelationIndexEntry> = read_jsonl(root.join("relation-index.jsonl"))?;
         let logs: Vec<LogIndexEntry> = read_jsonl(root.join("log-index.jsonl"))?;
-        let app_versions: Vec<AppVersionEntry> = read_optional_yaml(root.join("app-versions.yaml"))?
-            .unwrap_or_default();
+        let app_versions: Vec<AppVersionEntry> =
+            read_optional_yaml(root.join("app-versions.yaml"))?.unwrap_or_default();
 
         let resource_by_id = resources
             .iter()
@@ -97,11 +97,15 @@ impl Snapshot {
     }
 
     pub fn resource_by_id(&self, id: &str) -> Option<&ResourceIndexEntry> {
-        self.resource_by_id.get(id).map(|index| &self.resources[*index])
+        self.resource_by_id
+            .get(id)
+            .map(|index| &self.resources[*index])
     }
 
     pub fn resource_by_path(&self, path: &str) -> Option<&ResourceIndexEntry> {
-        self.resource_by_path.get(path).map(|index| &self.resources[*index])
+        self.resource_by_path
+            .get(path)
+            .map(|index| &self.resources[*index])
     }
 
     pub fn load_resource_value(&self, resource: &ResourceIndexEntry) -> anyhow::Result<Value> {

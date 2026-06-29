@@ -6,8 +6,8 @@ use serde::Serialize;
 use super::{
     cli::{SnapshotInput, emit_json, emit_text},
     queries::{
-        GatewayRouteTarget, IngressTarget, ServiceTarget, gateway_route_targets,
-        ingress_targets, service_targets,
+        GatewayRouteTarget, IngressTarget, ServiceTarget, gateway_route_targets, ingress_targets,
+        service_targets,
     },
     snapshot::Snapshot,
 };
@@ -83,7 +83,11 @@ pub fn build(snapshot: &Snapshot, namespace: Option<&str>) -> anyhow::Result<Gra
         if !is_topology_kind(source.kind.as_str()) || !is_topology_kind(target.kind.as_str()) {
             continue;
         }
-        if !allow_pair(namespace.as_deref(), source.namespace.as_deref(), target.namespace.as_deref()) {
+        if !allow_pair(
+            namespace.as_deref(),
+            source.namespace.as_deref(),
+            target.namespace.as_deref(),
+        ) {
             continue;
         }
         insert_resource(&mut nodes, target);
@@ -123,7 +127,11 @@ pub fn build(snapshot: &Snapshot, namespace: Option<&str>) -> anyhow::Result<Gra
         let Some(target) = snapshot.resource_by_id(&relation.target_id) else {
             continue;
         };
-        if !allow_pair(namespace.as_deref(), source.namespace.as_deref(), target.namespace.as_deref()) {
+        if !allow_pair(
+            namespace.as_deref(),
+            source.namespace.as_deref(),
+            target.namespace.as_deref(),
+        ) {
             continue;
         }
         insert_resource(&mut nodes, source);
@@ -176,13 +184,15 @@ pub fn run(command: GraphCommand) -> anyhow::Result<()> {
     let report = build(&snapshot, command.namespace.as_deref())?;
 
     match command.output.format {
-        GraphFormat::Markdown => {
-            emit_text(command.output.output.as_ref(), render_markdown(&report).as_str())
-        }
+        GraphFormat::Markdown => emit_text(
+            command.output.output.as_ref(),
+            render_markdown(&report).as_str(),
+        ),
         GraphFormat::Json => emit_json(command.output.output.as_ref(), &report),
-        GraphFormat::Mermaid => {
-            emit_text(command.output.output.as_ref(), render_mermaid(&report).as_str())
-        }
+        GraphFormat::Mermaid => emit_text(
+            command.output.output.as_ref(),
+            render_mermaid(&report).as_str(),
+        ),
     }
 }
 
@@ -263,17 +273,19 @@ fn insert_resource(
     nodes: &mut BTreeMap<String, GraphNode>,
     resource: &crate::gather::agent_artifacts::ResourceIndexEntry,
 ) {
-    nodes.entry(resource.id.clone()).or_insert_with(|| GraphNode {
-        id: resource.id.clone(),
-        label: format!(
-            "{} {}",
-            resource.kind,
-            qualified_name(resource.namespace.as_deref(), resource.name.as_str())
-        ),
-        kind: resource.kind.clone(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
-    });
+    nodes
+        .entry(resource.id.clone())
+        .or_insert_with(|| GraphNode {
+            id: resource.id.clone(),
+            label: format!(
+                "{} {}",
+                resource.kind,
+                qualified_name(resource.namespace.as_deref(), resource.name.as_str())
+            ),
+            kind: resource.kind.clone(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+        });
 }
 
 fn allow_namespace(filter: Option<&str>, namespace: Option<&str>) -> bool {
@@ -283,7 +295,11 @@ fn allow_namespace(filter: Option<&str>, namespace: Option<&str>) -> bool {
     }
 }
 
-fn allow_pair(filter: Option<&str>, source_namespace: Option<&str>, target_namespace: Option<&str>) -> bool {
+fn allow_pair(
+    filter: Option<&str>,
+    source_namespace: Option<&str>,
+    target_namespace: Option<&str>,
+) -> bool {
     allow_namespace(filter, source_namespace) || allow_namespace(filter, target_namespace)
 }
 
@@ -333,9 +349,7 @@ fn find_resource<'a>(
     name: &str,
 ) -> Option<&'a crate::gather::agent_artifacts::ResourceIndexEntry> {
     snapshot.resources.iter().find(|resource| {
-        resource.kind == kind
-            && resource.namespace.as_deref() == namespace
-            && resource.name == name
+        resource.kind == kind && resource.namespace.as_deref() == namespace && resource.name == name
     })
 }
 
@@ -351,18 +365,23 @@ mod tests {
         let snapshot = Snapshot::open(fixture.root()).expect("snapshot");
         let report = build(&snapshot, Some("default")).expect("report");
 
-        assert!(report
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "owns" && edge.to == "v1/Pod/default/web-abc"));
-        assert!(report
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "selects" && edge.from == "v1/Service/default/web"));
-        assert!(report
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "scheduled-on" && edge.to == "v1/Node/_cluster/worker1"));
+        assert!(
+            report
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "owns" && edge.to == "v1/Pod/default/web-abc")
+        );
+        assert!(
+            report
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "selects" && edge.from == "v1/Service/default/web")
+        );
+        assert!(
+            report.edges.iter().any(
+                |edge| edge.relation == "scheduled-on" && edge.to == "v1/Node/_cluster/worker1"
+            )
+        );
     }
 
     #[test]

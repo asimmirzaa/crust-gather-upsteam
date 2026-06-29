@@ -156,10 +156,7 @@ pub fn render_markdown(report: &DiffReport) -> String {
         out.push_str("- none\n\n");
     } else {
         for change in &report.resource_changes {
-            out.push_str(&format!(
-                "- {:?} `{}`\n",
-                change.change, change.id
-            ));
+            out.push_str(&format!("- {:?} `{}`\n", change.change, change.id));
         }
         out.push('\n');
     }
@@ -220,9 +217,10 @@ pub fn run(command: DiffCommand) -> anyhow::Result<()> {
     let report = build(&before, &after)?;
 
     match command.output.format {
-        AnalysisFormat::Markdown => {
-            emit_text(command.output.output.as_ref(), render_markdown(&report).as_str())
-        }
+        AnalysisFormat::Markdown => emit_text(
+            command.output.output.as_ref(),
+            render_markdown(&report).as_str(),
+        ),
         AnalysisFormat::Json => emit_json(command.output.output.as_ref(), &report),
     }
 }
@@ -301,7 +299,11 @@ fn namespaced_resource_counts(snapshot: &Snapshot) -> BTreeMap<String, usize> {
 
 fn namespaced_log_counts(snapshot: &Snapshot) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
-    for namespace in snapshot.logs.iter().filter_map(|log| log.namespace.as_ref()) {
+    for namespace in snapshot
+        .logs
+        .iter()
+        .filter_map(|log| log.namespace.as_ref())
+    {
         *counts.entry(namespace.clone()).or_insert(0) += 1;
     }
     counts
@@ -377,7 +379,12 @@ mod tests {
         assert!(report.resource_changes.iter().any(|change| {
             matches!(change.change, ResourceChangeKind::Changed) && change.name == "web-abc"
         }));
-        assert!(report.image_changes.iter().any(|change| change.after == "nginx:1.28.0"));
+        assert!(
+            report
+                .image_changes
+                .iter()
+                .any(|change| change.after == "nginx:1.28.0")
+        );
         assert_eq!(report.warning_delta, 1);
     }
 
@@ -421,7 +428,8 @@ mod tests {
         fs::write(&pod_path, content.replace("nginx:1.27.0", "nginx:1.28.0"))?;
 
         let warnings_path = root.join("run-warnings.yaml");
-        let mut warnings: Vec<RunMessage> = serde_yaml::from_str(&fs::read_to_string(&warnings_path)?)?;
+        let mut warnings: Vec<RunMessage> =
+            serde_yaml::from_str(&fs::read_to_string(&warnings_path)?)?;
         warnings.push(warnings[0].clone());
         fs::write(&warnings_path, serde_yaml::to_string(&warnings)?)?;
         Ok(())

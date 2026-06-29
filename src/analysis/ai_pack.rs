@@ -7,8 +7,7 @@ use serde::Serialize;
 use super::{
     audit,
     cli::{AnalysisFormat, OutputOptions, SnapshotInput, emit_json, emit_text},
-    graph,
-    summary,
+    graph, summary,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,11 +65,23 @@ pub fn build(snapshot: &super::snapshot::Snapshot) -> anyhow::Result<AiPack> {
             });
         }
     }
-    suspects.sort_by(|left, right| left.object.cmp(&right.object).then_with(|| left.reason.cmp(&right.reason)));
+    suspects.sort_by(|left, right| {
+        left.object
+            .cmp(&right.object)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
     suspects.dedup_by(|left, right| left.object == right.object && left.reason == right.reason);
 
-    let mut recommended_paths = suspects.iter().map(|suspect| suspect.path.clone()).collect::<Vec<_>>();
-    recommended_paths.extend(summary.log_hotspots.iter().map(|hotspot| hotspot.path.clone()));
+    let mut recommended_paths = suspects
+        .iter()
+        .map(|suspect| suspect.path.clone())
+        .collect::<Vec<_>>();
+    recommended_paths.extend(
+        summary
+            .log_hotspots
+            .iter()
+            .map(|hotspot| hotspot.path.clone()),
+    );
     recommended_paths.sort();
     recommended_paths.dedup();
     recommended_paths.truncate(20);
@@ -134,7 +145,12 @@ pub fn render_markdown(pack: &AiPack) -> String {
         .audit
         .findings
         .iter()
-        .filter(|finding| matches!(finding.severity, audit::Severity::Critical | audit::Severity::High))
+        .filter(|finding| {
+            matches!(
+                finding.severity,
+                audit::Severity::Critical | audit::Severity::High
+            )
+        })
         .collect::<Vec<_>>();
     if critical.is_empty() {
         out.push_str("- no high-severity findings\n\n");
@@ -195,7 +211,11 @@ mod tests {
         let pack = build(&snapshot).expect("pack");
 
         assert!(!pack.suspects.is_empty());
-        assert!(pack.recommended_paths.iter().any(|path| path.contains("web-abc")));
+        assert!(
+            pack.recommended_paths
+                .iter()
+                .any(|path| path.contains("web-abc"))
+        );
     }
 
     #[test]

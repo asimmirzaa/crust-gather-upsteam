@@ -151,9 +151,10 @@ pub fn run(command: AuditCommand) -> anyhow::Result<()> {
     let report = build(&snapshot)?;
 
     match command.output.format {
-        AnalysisFormat::Markdown => {
-            emit_text(command.output.output.as_ref(), render_markdown(&report).as_str())
-        }
+        AnalysisFormat::Markdown => emit_text(
+            command.output.output.as_ref(),
+            render_markdown(&report).as_str(),
+        ),
         AnalysisFormat::Json => emit_json(command.output.output.as_ref(), &report),
     }
 }
@@ -161,9 +162,11 @@ pub fn run(command: AuditCommand) -> anyhow::Result<()> {
 fn rbac_findings(snapshot: &Snapshot) -> anyhow::Result<Vec<AuditFinding>> {
     let mut findings = vec![];
 
-    for resource in snapshot.resources.iter().filter(|resource| {
-        matches!(resource.kind.as_str(), "ClusterRoleBinding" | "RoleBinding")
-    }) {
+    for resource in snapshot
+        .resources
+        .iter()
+        .filter(|resource| matches!(resource.kind.as_str(), "ClusterRoleBinding" | "RoleBinding"))
+    {
         let value = snapshot.load_resource_value(resource)?;
         if value.pointer("/roleRef/kind").and_then(Value::as_str) == Some("ClusterRole")
             && value.pointer("/roleRef/name").and_then(Value::as_str) == Some("cluster-admin")
@@ -178,7 +181,10 @@ fn rbac_findings(snapshot: &Snapshot) -> anyhow::Result<Vec<AuditFinding>> {
                             Some(format!(
                                 "{}:{}:{}",
                                 subject.get("kind")?.as_str()?,
-                                subject.get("namespace").and_then(Value::as_str).unwrap_or("_cluster"),
+                                subject
+                                    .get("namespace")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("_cluster"),
                                 subject.get("name")?.as_str()?
                             ))
                         })
@@ -288,7 +294,9 @@ fn exposure_findings(snapshot: &Snapshot) -> anyhow::Result<Vec<AuditFinding>> {
     }
 
     for exposure in exposures {
-        if exposure.kind == "Service" && matches!(exposure.exposure_type.as_str(), "LoadBalancer" | "NodePort") {
+        if exposure.kind == "Service"
+            && matches!(exposure.exposure_type.as_str(), "LoadBalancer" | "NodePort")
+        {
             findings.push(AuditFinding {
                 rule_id: "exposure.external-service".into(),
                 severity: Severity::Medium,
@@ -371,7 +379,10 @@ fn api_version_findings(snapshot: &Snapshot) -> anyhow::Result<Vec<AuditFinding>
 
 fn node_findings(snapshot: &Snapshot) -> anyhow::Result<Vec<AuditFinding>> {
     let mut findings = vec![];
-    for node in node_health(snapshot)?.into_iter().filter(|node| !node.ready) {
+    for node in node_health(snapshot)?
+        .into_iter()
+        .filter(|node| !node.ready)
+    {
         findings.push(AuditFinding {
             rule_id: "node.not-ready".into(),
             severity: Severity::Medium,
@@ -419,13 +430,29 @@ mod tests {
         let snapshot = Snapshot::open(fixture.root()).expect("snapshot");
         let report = build(&snapshot).expect("report");
 
-        assert!(report.findings.iter().any(|finding| finding.rule_id == "rbac.cluster-admin-binding"));
-        assert!(report.findings.iter().any(|finding| finding.rule_id == "rbac.wildcard-rules"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "rbac.cluster-admin-binding")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "rbac.wildcard-rules")
+        );
         assert!(report.findings.iter().any(|finding| {
             finding.rule_id == "workload.security-risk"
-                && finding.object.as_ref().is_some_and(|object| object.name == "debug-tool")
+                && finding
+                    .object
+                    .as_ref()
+                    .is_some_and(|object| object.name == "debug-tool")
         }));
-        assert_eq!(report.findings.first().expect("finding").severity, Severity::Critical);
+        assert_eq!(
+            report.findings.first().expect("finding").severity,
+            Severity::Critical
+        );
     }
 
     #[test]

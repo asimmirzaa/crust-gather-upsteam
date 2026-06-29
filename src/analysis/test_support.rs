@@ -9,13 +9,11 @@ use serde::Serialize;
 use tempfile::TempDir;
 
 use crate::gather::{
-    analysis_schema::AnalysisSchema,
     agent_artifacts::{
         LogIndexEntry, OwnerRefEntry, RelationIndexEntry, ResourceIndexEntry, ResourceReference,
     },
-    report::{
-        CollectorStats, InputLog, RunIdentity, RunInputs, RunMessage, RunReport, RunTotals,
-    },
+    analysis_schema::AnalysisSchema,
+    report::{CollectorStats, InputLog, RunIdentity, RunInputs, RunMessage, RunReport, RunTotals},
 };
 
 pub struct SampleSnapshot {
@@ -129,7 +127,10 @@ pub fn sample_snapshot(name: &str) -> anyhow::Result<SampleSnapshot> {
             phase: Some("Ready".into()),
             node_name: None,
             service_account: None,
-            labels: BTreeMap::from([("node-role.kubernetes.io/control-plane".into(), "true".into())]),
+            labels: BTreeMap::from([(
+                "node-role.kubernetes.io/control-plane".into(),
+                "true".into(),
+            )]),
             annotation_keys: vec![],
             owner_refs: vec![],
             containers: vec![],
@@ -321,7 +322,8 @@ pub fn sample_snapshot(name: &str) -> anyhow::Result<SampleSnapshot> {
             kind: "ClusterRoleBinding".into(),
             namespace: None,
             name: "admin-binding".into(),
-            path: "cluster/rbac.authorization.k8s.io-v1/clusterrolebinding/admin-binding.yaml".into(),
+            path: "cluster/rbac.authorization.k8s.io-v1/clusterrolebinding/admin-binding.yaml"
+                .into(),
             uid: Some("crb-admin".into()),
             resource_version: Some("1".into()),
             created_at: Some(started_at.to_rfc3339()),

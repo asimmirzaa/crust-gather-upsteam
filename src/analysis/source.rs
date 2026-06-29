@@ -42,7 +42,10 @@ impl SnapshotWorkspace {
     fn open_archive(path: &Path) -> anyhow::Result<Self> {
         let tempdir = TempDir::new().context("failed to create temp workspace")?;
         let extract_root = tempdir.path().to_path_buf();
-        let filename = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
 
         if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
             extract_tar_gz(path, &extract_root)?;

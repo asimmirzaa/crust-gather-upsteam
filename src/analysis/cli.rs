@@ -41,8 +41,7 @@ pub fn emit_text(output: Option<&PathBuf>, text: &str) -> anyhow::Result<()> {
             if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, text)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
         }
         None => {
             print!("{text}");

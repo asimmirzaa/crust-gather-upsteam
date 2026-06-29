@@ -9,8 +9,8 @@ use super::{
     cli::{AnalysisFormat, OutputOptions, SnapshotInput, emit_json, emit_text},
     queries::{
         ContainerResourceGap, ExposureSurface, GatewayRouteTarget, NodeHealth, PodHealth,
-        ServiceTarget, missing_resource_gaps, node_health, pod_health, service_targets,
-        exposure_surfaces, gateway_route_targets,
+        ServiceTarget, exposure_surfaces, gateway_route_targets, missing_resource_gaps,
+        node_health, pod_health, service_targets,
     },
     snapshot::Snapshot,
 };
@@ -141,7 +141,11 @@ pub fn render_markdown(report: &SummaryReport) -> String {
     if report.collector_issues.is_empty() {
         out.push_str("- none\n\n");
     } else {
-        for issue in report.collector_issues.iter().take(MARKDOWN_COLLECTOR_LIMIT) {
+        for issue in report
+            .collector_issues
+            .iter()
+            .take(MARKDOWN_COLLECTOR_LIMIT)
+        {
             out.push_str(&format!(
                 "- `{}`: failed_objects={}, warnings={}, listed={}, collected={}, written={}\n",
                 issue.collector,
@@ -152,7 +156,11 @@ pub fn render_markdown(report: &SummaryReport) -> String {
                 issue.written_files
             ));
         }
-        append_omitted(&mut out, report.collector_issues.len(), MARKDOWN_COLLECTOR_LIMIT);
+        append_omitted(
+            &mut out,
+            report.collector_issues.len(),
+            MARKDOWN_COLLECTOR_LIMIT,
+        );
         out.push('\n');
     }
 
@@ -211,11 +219,7 @@ pub fn render_markdown(report: &SummaryReport) -> String {
     if report.missing_resource_gaps.is_empty() {
         out.push_str("- no missing resource request/limit gaps detected\n\n");
     } else {
-        for gap in report
-            .missing_resource_gaps
-            .iter()
-            .take(MARKDOWN_GAP_LIMIT)
-        {
+        for gap in report.missing_resource_gaps.iter().take(MARKDOWN_GAP_LIMIT) {
             out.push_str(&format!(
                 "- `{}/{}` container `{}`: {}\n",
                 gap.object.namespace.as_deref().unwrap_or("_cluster"),
@@ -307,9 +311,10 @@ pub fn run(command: SummaryCommand) -> anyhow::Result<()> {
     let report = build(&snapshot)?;
 
     match command.output.format {
-        AnalysisFormat::Markdown => {
-            emit_text(command.output.output.as_ref(), render_markdown(&report).as_str())
-        }
+        AnalysisFormat::Markdown => emit_text(
+            command.output.output.as_ref(),
+            render_markdown(&report).as_str(),
+        ),
         AnalysisFormat::Json => emit_json(command.output.output.as_ref(), &report),
     }
 }
@@ -386,7 +391,11 @@ fn namespace_activity(snapshot: &Snapshot) -> Vec<NamespaceActivity> {
         }
     }
 
-    for log in snapshot.logs.iter().filter_map(|log| log.namespace.as_ref()) {
+    for log in snapshot
+        .logs
+        .iter()
+        .filter_map(|log| log.namespace.as_ref())
+    {
         let entry = summary
             .entry(log.clone())
             .or_insert_with(|| NamespaceActivity {
@@ -429,8 +438,18 @@ mod tests {
         let report = build(&snapshot).expect("report");
 
         assert!(!report.non_ready_nodes.is_empty());
-        assert!(report.pod_hotspots.iter().any(|pod| pod.object.name == "web-abc"));
-        assert!(report.orphan_services.iter().any(|service| service.object.name == "orphan"));
+        assert!(
+            report
+                .pod_hotspots
+                .iter()
+                .any(|pod| pod.object.name == "web-abc")
+        );
+        assert!(
+            report
+                .orphan_services
+                .iter()
+                .any(|service| service.object.name == "orphan")
+        );
         assert!(
             report
                 .exposure_surfaces

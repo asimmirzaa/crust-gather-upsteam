@@ -473,6 +473,7 @@ pub struct GatherSettings {
     pub debug_pod: DebugPod,
 
     /// Controls whether node-level debug pods are used for host log collection.
+    /// Defaults to disabled. Use `--node-log-mode=deep` for privileged node-log collection.
     #[arg(long, value_enum)]
     #[serde(default)]
     pub node_log_mode: Option<NodeLogMode>,
@@ -835,8 +836,8 @@ impl DebugPod {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum NodeLogMode {
-    Disabled,
     #[default]
+    Disabled,
     Deep,
 }
 
@@ -1378,7 +1379,6 @@ mod tests {
     use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
     use kube::core::{ObjectMeta, params::ListParams};
     use kube::{Api, api::PostParams};
-    use serde_json::Value;
     use tempfile::TempDir;
     use tokio::fs;
 
@@ -1394,6 +1394,25 @@ mod tests {
     fn test_filter_list_matches_filters_field_count() {
         let filters = Filters::default();
         assert_eq!(FilterList::from(&filters).0.len(), 12);
+    }
+
+    #[test]
+    fn node_log_mode_defaults_to_disabled() {
+        assert_eq!(NodeLogMode::default(), NodeLogMode::Disabled);
+        assert_eq!(
+            GatherSettings::default().node_log_mode_value(),
+            NodeLogMode::Disabled
+        );
+    }
+
+    #[test]
+    fn node_log_mode_can_be_enabled_for_deep_collection() {
+        let settings = GatherSettings {
+            node_log_mode: Some(NodeLogMode::Deep),
+            ..Default::default()
+        };
+
+        assert_eq!(settings.node_log_mode_value(), NodeLogMode::Deep);
     }
 
     #[tokio::test]

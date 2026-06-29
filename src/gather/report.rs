@@ -64,7 +64,7 @@ impl Default for RunInputs {
             list_page_limit: 100,
             collect_concurrency: 32,
             log_collect_concurrency: 8,
-            node_log_mode: "deep".to_string(),
+            node_log_mode: "disabled".to_string(),
             debug_pod_image: None,
             systemd_units: vec![],
             additional_logs: vec![],
